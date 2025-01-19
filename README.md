@@ -38,25 +38,7 @@ This addon enables real-time monitoring of Tecomat Foxtrot PLC variables in Home
 
 Here's a basic configuration example:
 
-```yaml
-plc_host: "192.168.10.100"
-plc_port: 5010
-mqtt_host: "core-mosquitto"
-mqtt_port: 1883
-mqtt_user: "your_mqtt_user"
-mqtt_password: "your_mqtt_password"
-mqtt_topic: "plc/foxtrot"
-refresh_interval: 5
-variables:
-  - name: "AC_EON.L123_KW"
-    type: "REAL"
-    unitOfMeasurement: "kW"
-    calculateEnergy: true
-  - name: "AC_FVE.L123_KW"
-    type: "REAL"
-    unitOfMeasurement: "kW"
-    calculateEnergy: true
-```
+Configure the addon using options in the addon.
 
 For detailed configuration options, see [CONFIGURATION.md](documentation/CONFIGURATION.md)
 

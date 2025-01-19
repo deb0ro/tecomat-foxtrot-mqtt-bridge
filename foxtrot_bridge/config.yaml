@@ -23,7 +23,7 @@ options:
   mqtt_user: "MQTTUSER"
   mqtt_password: "MQTTPWD"
   mqtt_topic: "plc/foxtrot"
-  refresh_interval: 5
+  refresh_interval: 10
   variables:
     - name: "AC_EON.L123_KW"
       type: "REAL"

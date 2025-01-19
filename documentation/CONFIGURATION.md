@@ -28,14 +28,14 @@ Each variable in the `variables` list requires:
 ## Full Configuration Example
 
 ```yaml
-plc_host: "192.168.10.100"
+plc_host: "IPADDRESS"
 plc_port: 5010
 mqtt_host: "core-mosquitto"
 mqtt_port: 1883
-mqtt_user: "mqtt_user"
-mqtt_password: "mqtt_password"
+mqtt_user: "MQTTUSER"
+mqtt_password: "MQTTPWD"
 mqtt_topic: "plc/foxtrot"
-refresh_interval: 5
+refresh_interval: 10
 variables:
   # Power measurements with energy calculation
   - name: "AC_EON.L123_KW"

@@ -32,8 +32,8 @@ fi
 
 # Validate refresh interval
 if ! [[ "$REFRESH_INTERVAL" =~ ^[0-9]+$ ]]; then
-    echo "Warning: Invalid refresh interval. Setting to default value of 5 seconds."
-    REFRESH_INTERVAL=5
+    echo "Warning: Invalid refresh interval. Setting to default value of 10 seconds."
+    REFRESH_INTERVAL=10
 fi
 
 echo "Using refresh interval: ${REFRESH_INTERVAL} seconds"
