@@ -1,0 +1,49 @@
+name: "Tecomat Foxtrot Bridge"
+version: "1.1.5"
+slug: "foxtrot_bridge"
+description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
+url: "https://github.com/yourusername/ha-foxtrot-bridge"
+init: false
+arch:
+  - armhf
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+startup: application
+boot: auto
+uart: false
+map:
+  - config:rw
+options:
+  plc_host: "IPADDRESS"
+  plc_port: 5010
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: "MQTTUSER"
+  mqtt_password: "MQTTPWD"
+  mqtt_topic: "plc/foxtrot"
+  refresh_interval: 5
+  variables:
+    - name: "AC_EON.L123_KW"
+      type: "REAL"
+      unitOfMeasurement: 'kW'
+      calculateEnergy: true
+    - name: "AC_FVE.L123_KW"
+      type: "REAL"
+      unitOfMeasurement: 'kW'
+      calculateEnergy: true
+schema:
+  plc_host: str
+  plc_port: port
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str
+  mqtt_password: str
+  mqtt_topic: str
+  refresh_interval: int
+  variables:
+    - name: str
+      type: str
+      unitOfMeasurement: str
+      calculateEnergy: bool?
