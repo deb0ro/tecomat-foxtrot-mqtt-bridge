@@ -100,10 +100,13 @@ class PlcMqttBridge {
         config.variables.forEach(variable => {
             // Sanitize variable name for MQTT discovery topic
             const sanitizedName = variable.name
-            .replace(/\./g, '_')
-            .replace(/[\[\]]/g, '_')   // Replace brackets with underscores
-            .replace(/\W/g, '_');      // Replace any other non-word chars
+            .replace(/[^a-zA-Z0-9-_]/g, '_');  // For MQTT topic (strict)
         
+            const uniqueId = variable.name         // For Home Assistant (keep old format)
+            .replace(/\./g, '_')
+            .replace(/\[/g, '_')              // Replace '[' with '_'
+            .replace(/\]/g, '')               // Remove ']'
+            .replace(/\W/g, '_');
             
             // Power sensor (kW)
             const powerDiscoveryTopic = `homeassistant/sensor/${sanitizedName}/config`;
