@@ -1,5 +1,5 @@
 name: "Tecomat Foxtrot Bridge"
-version: "1.1.5"
+version: "1.1.6"
 slug: "foxtrot_bridge"
 description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
 url: "https://github.com/yourusername/ha-foxtrot-bridge"

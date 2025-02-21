@@ -26,7 +26,7 @@ This addon enables real-time monitoring of Tecomat Foxtrot PLC variables in Home
 
 1. Add this repository to your Home Assistant instance:
    ```
-   https://github.com/yourusername/ha-foxtrot-bridge
+   https://github.com/deb0ro/ha-foxtrot-bridge
    ```
 
 2. Search for "Tecomat Foxtrot Bridge" in the Add-on Store
