@@ -100,12 +100,9 @@ class PlcMqttBridge {
         config.variables.forEach(variable => {
             // Sanitize variable name for MQTT discovery topic
             const sanitizedName = variable.name
-            .replace(/[^a-zA-Z0-9-_]/g, '_'); // For MQTT topic: stricter sanitization
-        
-            const uniqueId = variable.name
-            .replace(/\./g, '_')    // Replace periods with underscores
-            .replace(/[\[\]]/g, '') // Remove square brackets without replacing with underscores
-            .replace(/\W/g, '_');   // Replace non-word characters except underscore and dash
+            .replace(/\./g, '_')
+            .replace(/[\[\]]/g, '_')   // Replace brackets with underscores
+            .replace(/\W/g, '_');      // Replace any other non-word chars
         
             
             // Power sensor (kW)
