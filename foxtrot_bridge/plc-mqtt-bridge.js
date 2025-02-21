@@ -108,30 +108,68 @@ class PlcMqttBridge {
             const powerDiscoveryTopic = `homeassistant/sensor/${sanitizedName}/config`;
             const powerStateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
             
+            // Determine appropriate device class based on unit of measurement
+            let deviceClass = null;
+            let stateClass = "measurement";
+            
+            switch(variable.unitOfMeasurement) {
+                case 'kW':
+                case 'W':
+                case 'MW':
+                case 'GW':
+                    deviceClass = "power";
+                    break;
+                case '°C':
+                case '℃':
+                    deviceClass = "temperature";
+                    break;
+                case 'h':
+                case 'min':
+                case 's':
+                    deviceClass = "duration";
+                    break;
+                case '%':
+                    deviceClass = "humidity";
+                    break;
+                case 'V':
+                    deviceClass = "voltage";
+                    break;
+                case 'A':
+                    deviceClass = "current";
+                    break;
+                // Add more mappings as needed
+            }
+            
             const powerDiscoveryMessage = {
                 name: `${variable.name}`,
                 state_topic: powerStateTopic,
                 unit_of_measurement: variable.unitOfMeasurement,
-                device_class: "power",
-                state_class: "measurement",
-                unique_id: `plc_${sanitizedName}_power`,
+                unique_id: `plc_${sanitizedName}_sensor`,
                 device: {
                     identifiers: ['plc_foxtrot_bridge'],
                     name: 'PLC Foxtrot Bridge',
                     manufacturer: 'Custom Integration'
                 }
             };
+            
+            // Only add device_class if we have a valid one
+            if (deviceClass) {
+                powerDiscoveryMessage.device_class = deviceClass;
+            }
+            
+            // Add state_class for measurements
+            powerDiscoveryMessage.state_class = stateClass;
 
-            // Publish power sensor discovery
+            // Publish sensor discovery
             this.mqttClient.publish(
                 powerDiscoveryTopic, 
                 JSON.stringify(powerDiscoveryMessage), 
                 { retain: true, qos: 1 },
                 (err) => {
                     if (err) {
-                        console.error(`Error publishing power discovery message for ${variable.name}:`, err);
+                        console.error(`Error publishing sensor discovery message for ${variable.name}:`, err);
                     } else {
-                        console.log(`Successfully published power discovery message for ${variable.name}`);
+                        console.log(`Successfully published sensor discovery message for ${variable.name}`);
                     }
                 }
             );
