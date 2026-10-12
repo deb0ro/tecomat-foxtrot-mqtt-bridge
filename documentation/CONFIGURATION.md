@@ -44,6 +44,24 @@ PLCComS itself has no authentication, so keep the PLC on a trusted network segme
 Changing a variable from `sensor` to `number` (or `binary_sensor` to `switch`) creates a new entity in
 Home Assistant; the old one is removed from MQTT discovery automatically.
 
+## Values from the PLC web pages
+
+Some values (e.g. the room correction of the heating curve) are only shown on the PLC web pages and are not part of
+the PLCComS public file. `web_variables` reads them read-only from the PLC web server (`plc_host`, `web_port`).
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `web_port` | number | PLC web server port (default 80) |
+| `web_user` / `web_password` | string | Web login, empty by default |
+| `web_variables[].name` | string | Name used for MQTT topics and the entity |
+| `web_variables[].page` | string | Page XML, e.g. `MUZONA1.XML` |
+| `web_variables[].input` | string | Input hash from the page source, e.g. `__T17573290` (the `_TYPE_format` suffix is ignored) |
+| `web_variables[].type` | string | `REAL`, `BOOL`, ... |
+| `web_variables[].entity` | string | `sensor` (default) or `binary_sensor` |
+
+Find the hash by opening the page in a browser and viewing its source (`view-source:http://<plc>/MUZONA1.XML`).
+The bridge logs in the same way as the browser (`PASS = sha1(SoftPLC cookie + password)`) and re-logs on session expiry.
+
 ## Full Configuration Example
 
 ```yaml

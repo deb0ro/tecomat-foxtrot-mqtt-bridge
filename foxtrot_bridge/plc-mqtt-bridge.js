@@ -1,4 +1,6 @@
 const net = require('net');
+const http = require('http');
+const crypto = require('crypto');
 const mqtt = require('mqtt');
 const iconv = require('iconv-lite');
 
@@ -44,13 +46,29 @@ const config = {
             step: parseOptionalNumber(variable.step),
         };
     }),
+    // Values that only exist on the PLC web pages (not in the PLCComS public file), read-only
+    web: {
+        port: parseInt(process.env.WEB_PORT) || 80,
+        user: process.env.WEB_USER || '',
+        password: process.env.WEB_PASSWORD || '',
+    },
+    webVariables: JSON.parse(process.env.WEB_VARIABLES || '[]').map(variable => ({
+        name: variable.name,
+        page: variable.page,
+        input: variable.input,
+        type: (variable.type || 'REAL').toUpperCase(),
+        entity: (variable.entity || 'sensor').toLowerCase() === 'binary_sensor' ? 'binary_sensor' : 'sensor',
+        unitOfMeasurement: variable.unitOfMeasurement || '',
+        calculateEnergy: false,
+    })),
     interval: (parseInt(process.env.REFRESH_INTERVAL) || 5) * 1000, // Convert to milliseconds with fallback
 };
 
 // Validate configuration
 console.log('Configuration:', {
     ...config,
-    mqtt: { ...config.mqtt, password: '****' } // Hide password in logs
+    mqtt: { ...config.mqtt, password: '****' }, // Hide password in logs
+    web: { ...config.web, password: config.web.password ? '****' : '' }
 });
 
 const isWritable = (variable) => config.writeEnabled && WRITABLE_ENTITIES.includes(variable.entity);
@@ -214,7 +232,7 @@ class PlcMqttBridge {
     }
 
     sendMqttDiscoveryMessages() {
-        config.variables.forEach(variable => {
+        [...config.variables, ...config.webVariables].forEach(variable => {
             // Sanitize variable name for MQTT discovery topic
             const sanitizedName = variable.name
             .replace(/[^a-zA-Z0-9-_]/g, '_');  // For MQTT topic (strict)
@@ -409,6 +427,86 @@ class PlcMqttBridge {
                 this.requestPlcUpdates();
             }
         }, this.plcRequestInterval);
+
+        if (config.webVariables.length) {
+            this.webCookie = null;
+            this.webPolling = false;
+            this.pollWebPages();
+            setInterval(() => this.pollWebPages(), this.plcRequestInterval);
+        }
+    }
+
+    webRequest(method, path, body) {
+        return new Promise((resolve, reject) => {
+            const headers = {};
+            if (this.webCookie) headers.Cookie = `SoftPLC=${this.webCookie}`;
+            if (body !== undefined) {
+                headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                headers['Content-Length'] = Buffer.byteLength(body);
+            }
+            const req = http.request({ host: config.plc.host, port: config.web.port, method, path, headers, timeout: 5000 }, (res) => {
+                const cookie = (res.headers['set-cookie'] || []).map(c => /SoftPLC=([^;]+)/.exec(c)).find(Boolean);
+                if (cookie) this.webCookie = cookie[1];
+                const chunks = [];
+                res.on('data', chunk => chunks.push(chunk));
+                res.on('end', () => resolve({ status: res.statusCode, location: res.headers.location || '', body: iconv.decode(Buffer.concat(chunks), 'win1250') }));
+            });
+            req.on('timeout', () => req.destroy(new Error('timeout')));
+            req.on('error', reject);
+            if (body !== undefined) req.write(body);
+            req.end();
+        });
+    }
+
+    async webLogin() {
+        // The login page hands out the session cookie; the password is sent as sha1(cookie + password)
+        this.webCookie = null;
+        await this.webRequest('GET', '/SYSWWW/LOGIN.XML');
+        if (!this.webCookie) throw new Error('PLC web did not set a session cookie');
+        const pass = crypto.createHash('sha1').update(this.webCookie + config.web.password).digest('hex');
+        const res = await this.webRequest('POST', '/SYSWWW/LOGIN.XML',
+            `USER=${encodeURIComponent(config.web.user)}&PASS=${pass}`);
+        if (res.status !== 302 || /LOGIN/i.test(res.location)) {
+            throw new Error(`PLC web login failed (HTTP ${res.status} ${res.location})`);
+        }
+        console.log('Logged in to PLC web interface');
+    }
+
+    async fetchWebPage(page) {
+        let res = await this.webRequest('GET', `/${page}`);
+        if (res.status === 302 || /<LOGIN>/.test(res.body)) {
+            await this.webLogin();
+            res = await this.webRequest('GET', `/${page}`);
+        }
+        if (res.status !== 200) throw new Error(`PLC web page ${page} returned HTTP ${res.status}`);
+        return res.body;
+    }
+
+    async pollWebPages() {
+        if (this.webPolling) return;
+        this.webPolling = true;
+        try {
+            const pages = [...new Set(config.webVariables.map(v => v.page))];
+            for (const page of pages) {
+                try {
+                    const body = await this.fetchWebPage(page);
+                    config.webVariables.filter(v => v.page === page).forEach(variable => {
+                        // Inputs are named <hash>_<TYPE>_<format>; the same hash may repeat with another format
+                        const match = new RegExp(`<INPUT NAME="${variable.input}_[^"]*" VALUE="([^"]*)"`).exec(body);
+                        if (match) {
+                            this.publishToMqtt(variable, match[1]);
+                        } else {
+                            console.warn(`Web input ${variable.input} not found on ${page}`);
+                        }
+                    });
+                } catch (error) {
+                    console.error(`Error reading PLC web page ${page}:`, error.message);
+                    this.webCookie = null;
+                }
+            }
+        } finally {
+            this.webPolling = false;
+        }
     }
 
     connectPlc() {
