@@ -1,28 +1,15 @@
 ARG BUILD_ARCH=aarch64
-# Newer Supervisor no longer passes BUILD_FROM, fall back to the official base image
-ARG BUILD_FROM=ghcr.io/home-assistant/${BUILD_ARCH}-base:latest
+# Newer Supervisor no longer passes BUILD_FROM; pin the official base image so builds are reproducible
+ARG BUILD_FROM=ghcr.io/home-assistant/${BUILD_ARCH}-base:3.24
 FROM $BUILD_FROM
 
-# Install required packages
-RUN apk add --no-cache \
-    nodejs \
-    npm \
-    bash \
-    jq
+RUN apk add --no-cache nodejs npm
 
-# Create app directory
 WORKDIR /app
 
-# Copy package files
-COPY package.json . 
-COPY run.sh . 
-COPY plc-mqtt-bridge.js . 
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Install dependencies
-RUN npm install
+COPY plc-mqtt-bridge.js ./
 
-# Make run script executable
-RUN chmod +x /app/run.sh
-
-# Command to run the add-on
-CMD ["/app/run.sh"]
+CMD ["node", "/app/plc-mqtt-bridge.js"]

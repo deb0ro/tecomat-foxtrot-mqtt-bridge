@@ -1,6 +1,9 @@
 // Integration test: fake PLCComS + in-process MQTT broker + real bridge process
 const net = require('net');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const mqtt = require('mqtt');
 const iconv = require('iconv-lite');
 const aedes = require('aedes')();
@@ -79,11 +82,17 @@ plc.listen(15010, () => broker.listen(11883, async () => {
     await new Promise(r => pre.publish('plc/foxtrot/AC_EON.L123_KW/energy/state', '100.000', { retain: true, qos: 1 }, r));
     pre.end();
 
-    const bridge = spawn('node', [process.argv[2]], {
-        env: { ...process.env, PLC_HOST: '127.0.0.1', PLC_PORT: '15010', MQTT_HOST: '127.0.0.1', MQTT_PORT: '11883',
-            MQTT_USER: 'u', MQTT_PASSWORD: 'p', MQTT_TOPIC: 'plc/foxtrot', REFRESH_INTERVAL: '1', RESYNC_INTERVAL: '30',
-            WRITE_ENABLED: writeEnabled, VARIABLES: JSON.stringify(variables) },
-    });
+    // The bridge reads Supervisor-style options from OPTIONS_PATH
+    const writeOptions = (extra) => {
+        const file = path.join(os.tmpdir(), `foxtrot-bridge-test-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+        fs.writeFileSync(file, JSON.stringify({
+            plc_host: '127.0.0.1', plc_port: 15010, mqtt_host: '127.0.0.1', mqtt_port: 11883,
+            mqtt_user: 'u', mqtt_password: 'p', mqtt_topic: 'plc/foxtrot', refresh_interval: 1, resync_interval: 30,
+            log_level: 'info', write_enabled: writeEnabled === 'true', variables, web_variables: [], ...extra,
+        }));
+        return file;
+    };
+    const bridge = spawn('node', [process.argv[2]], { env: { ...process.env, OPTIONS_PATH: writeOptions({}) } });
     let bridgeOut = '';
     bridge.stdout.on('data', d => bridgeOut += d); bridge.stderr.on('data', d => bridgeOut += d);
 
@@ -166,10 +175,32 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         await wait(6500);
         check('watchdog reconnects and status back online', msgs['plc/foxtrot/plc/status'] === 'online' && (bridgeOut.match(/Connected to PLC/g) || []).length > connectsBefore);
 
-        // Last will: broker announces offline when the bridge dies
-        bridge.kill('SIGKILL');
+        // Log level: per-message chatter only at debug
+        check('info log level hides per-message logs', !/Successfully published state/.test(bridgeOut) && /\[INFO\] Connected to PLC/.test(bridgeOut));
+
+        // Clean stop announces offline itself
+        if (process.platform === 'win32') {
+            // Windows has no catchable SIGTERM; kill() terminates and the last will would make this pass falsely
+            console.log('SKIP SIGTERM -> bridge status offline (not testable on Windows)');
+            bridge.kill();
+        } else {
+            bridge.kill('SIGTERM');
+            await wait(1500);
+            check('SIGTERM -> bridge status offline', msgs['plc/foxtrot/bridge/status'] === 'offline', msgs['plc/foxtrot/bridge/status']);
+        }
+
+        // Last will: broker announces offline when the bridge dies without a goodbye
+        await new Promise(r => client.publish('plc/foxtrot/bridge/status', 'online', { retain: true }, r));
+        const crashing = spawn('node', [process.argv[2]], { env: { ...process.env, OPTIONS_PATH: writeOptions({}) } });
+        await wait(2500);
+        crashing.kill('SIGKILL');
         await wait(1500);
         check('bridge last will -> offline', msgs['plc/foxtrot/bridge/status'] === 'offline', msgs['plc/foxtrot/bridge/status']);
+
+        // Names that collide after sanitizing are rejected at start
+        const dup = spawnSync('node', [process.argv[2]], { env: { ...process.env, OPTIONS_PATH: writeOptions({
+            variables: [{ name: 'A.B', type: 'REAL' }, { name: 'A_B', type: 'REAL' }] }) }, timeout: 5000 });
+        check('colliding names rejected', dup.status === 1 && /same entity id/.test(String(dup.stderr)), String(dup.stderr).trim());
     }
 
     bridge.kill(); client.end(true); plc.close(); broker.close(); aedes.close();

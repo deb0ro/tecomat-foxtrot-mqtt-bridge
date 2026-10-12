@@ -1,20 +1,15 @@
 name: "Tecomat Foxtrot Bridge"
-version: "1.5.0"
+version: "1.6.0"
 slug: "foxtrot_bridge"
 description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
 url: "https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge"
 init: false
 arch:
-  - armhf
-  - armv7
   - aarch64
   - amd64
-  - i386
 startup: application
 boot: auto
 uart: false
-map:
-  - config:rw
 options:
   plc_host: "IPADDRESS"
   plc_port: 5010
@@ -24,6 +19,7 @@ options:
   mqtt_password: "MQTTPWD"
   mqtt_topic: "plc/foxtrot"
   refresh_interval: 10
+  log_level: info
   write_enabled: true
   variables:
     - name: "AC_EON.L123_KW"
@@ -41,10 +37,11 @@ schema:
   mqtt_host: str
   mqtt_port: port
   mqtt_user: str
-  mqtt_password: str
+  mqtt_password: password
   mqtt_topic: str
   refresh_interval: int
   resync_interval: int?
+  log_level: list(error|warning|info|debug)?
   write_enabled: bool?
   variables:
     - name: str

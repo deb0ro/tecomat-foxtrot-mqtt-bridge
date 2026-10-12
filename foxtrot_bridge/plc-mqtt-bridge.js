@@ -1,8 +1,22 @@
+const fs = require('fs');
 const net = require('net');
 const http = require('http');
 const crypto = require('crypto');
 const mqtt = require('mqtt');
 const iconv = require('iconv-lite');
+
+// Supervisor writes the add-on options here; OPTIONS_PATH lets tests point elsewhere
+const OPTIONS_PATH = process.env.OPTIONS_PATH || '/data/options.json';
+const options = JSON.parse(fs.readFileSync(OPTIONS_PATH, 'utf8'));
+
+const LOG_LEVELS = { error: 0, warning: 1, info: 2, debug: 3 };
+const logLevel = LOG_LEVELS[options.log_level] ?? LOG_LEVELS.info;
+const log = {
+    error: (...args) => logLevel >= LOG_LEVELS.error && console.error('[ERROR]', ...args),
+    warn: (...args) => logLevel >= LOG_LEVELS.warning && console.warn('[WARN]', ...args),
+    info: (...args) => logLevel >= LOG_LEVELS.info && console.log('[INFO]', ...args),
+    debug: (...args) => logLevel >= LOG_LEVELS.debug && console.log('[DEBUG]', ...args),
+};
 
 // Entity types that accept commands from Home Assistant
 const WRITABLE_ENTITIES = ['switch', 'number'];
@@ -30,24 +44,23 @@ const commonVariableOptions = (variable) => ({
     stateClass: variable.stateClass,
 });
 
-// Load configuration from environment variables
 const config = {
     plc: {
-        host: process.env.PLC_HOST,
-        port: parseInt(process.env.PLC_PORT),
+        host: options.plc_host,
+        port: options.plc_port,
     },
     mqtt: {
-        host: process.env.MQTT_HOST,
-        port: parseInt(process.env.MQTT_PORT),
-        username: process.env.MQTT_USER,
-        password: process.env.MQTT_PASSWORD,
-        baseTopic: process.env.MQTT_TOPIC,
+        host: options.mqtt_host,
+        port: options.mqtt_port,
+        username: options.mqtt_user,
+        password: options.mqtt_password,
+        baseTopic: options.mqtt_topic,
     },
-    writeEnabled: process.env.WRITE_ENABLED !== 'false',
-    variables: JSON.parse(process.env.VARIABLES || '[]').map(variable => {
+    writeEnabled: options.write_enabled !== false,
+    variables: (options.variables || []).map(variable => {
         let entity = (variable.entity || 'sensor').toLowerCase();
         if (!SUPPORTED_ENTITIES.includes(entity)) {
-            console.warn(`Unsupported entity '${entity}' for ${variable.name}, falling back to sensor`);
+            log.warn(`Unsupported entity '${entity}' for ${variable.name}, falling back to sensor`);
             entity = 'sensor';
         }
         const type = (variable.type || 'REAL').toUpperCase();
@@ -65,11 +78,11 @@ const config = {
     }),
     // Values that only exist on the PLC web pages (not in the PLCComS public file), read-only
     web: {
-        port: parseInt(process.env.WEB_PORT) || 80,
-        user: process.env.WEB_USER || '',
-        password: process.env.WEB_PASSWORD || '',
+        port: options.web_port || 80,
+        user: options.web_user || '',
+        password: options.web_password || '',
     },
-    webVariables: JSON.parse(process.env.WEB_VARIABLES || '[]').map(variable => ({
+    webVariables: (options.web_variables || []).map(variable => ({
         ...commonVariableOptions(variable),
         source: 'web',
         page: variable.page,
@@ -77,13 +90,32 @@ const config = {
         entity: (variable.entity || 'sensor').toLowerCase() === 'binary_sensor' ? 'binary_sensor' : 'sensor',
         calculateEnergy: false,
     })),
-    interval: (parseInt(process.env.REFRESH_INTERVAL) || 5) * 1000, // Convert to milliseconds with fallback
+    interval: (parseInt(options.refresh_interval) || 5) * 1000, // Convert to milliseconds with fallback
     // Full re-read of all PLCComS variables; changes in between arrive as DIFF pushes
-    resyncInterval: Math.max(parseInt(process.env.RESYNC_INTERVAL) || 60, 10) * 1000,
+    resyncInterval: Math.max(parseInt(options.resync_interval) || 60, 10) * 1000,
 };
 
-// Validate configuration
-console.log('Configuration:', {
+if (!config.plc.host || !config.plc.port || !config.mqtt.host || !config.mqtt.port) {
+    log.error('Missing plc_host, plc_port, mqtt_host or mqtt_port in', OPTIONS_PATH);
+    process.exit(1);
+}
+
+const sanitizeName = (name) => name.replace(/[^a-zA-Z0-9-_]/g, '_');
+
+// Names that differ only in punctuation (A.B vs A_B) would share discovery topics and unique ids
+{
+    const seen = new Map();
+    for (const variable of [...config.variables, ...config.webVariables]) {
+        const key = sanitizeName(variable.name);
+        if (seen.has(key)) {
+            log.error(`Variables '${seen.get(key)}' and '${variable.name}' map to the same entity id '${key}'; rename one of them`);
+            process.exit(1);
+        }
+        seen.set(key, variable.name);
+    }
+}
+
+log.info('Configuration:', {
     ...config,
     mqtt: { ...config.mqtt, password: '****' }, // Hide password in logs
     web: { ...config.web, password: config.web.password ? '****' : '' }
@@ -119,12 +151,12 @@ class PlcMqttBridge {
 
         // Add periodic connection status logging
         setInterval(() => {
-            console.log(`Connection Status - PLC: ${this.plcConnected}, MQTT: ${this.mqttConnected}`);
+            log.debug(`Connection Status - PLC: ${this.plcConnected}, MQTT: ${this.mqttConnected}`);
         }, 30000);
     }
 
     setupMqtt() {
-        console.log('Setting up MQTT connection...');
+        log.info('Setting up MQTT connection...');
         const mqttUrl = `mqtt://${config.mqtt.host}:${config.mqtt.port}`;
 
         this.mqttClient = mqtt.connect(mqttUrl, {
@@ -138,7 +170,7 @@ class PlcMqttBridge {
         });
 
         this.mqttClient.on('connect', () => {
-            console.log('Connected to MQTT broker');
+            log.info('Connected to MQTT broker');
             this.mqttConnected = true;
             this.mqttClient.publish(statusTopic('bridge'), 'online', { retain: true, qos: 1 });
             this.publishSourceStatus('plc', this.plcConnected, true);
@@ -160,17 +192,17 @@ class PlcMqttBridge {
         });
 
         this.mqttClient.on('error', (error) => {
-            console.error('MQTT Error:', error);
+            log.error('MQTT Error:', error);
             this.mqttConnected = false;
         });
 
         this.mqttClient.on('close', () => {
-            console.log('MQTT connection closed');
+            log.info('MQTT connection closed');
             this.mqttConnected = false;
         });
 
         this.mqttClient.on('offline', () => {
-            console.log('MQTT client is offline');
+            log.info('MQTT client is offline');
             this.mqttConnected = false;
         });
     }
@@ -199,7 +231,7 @@ class PlcMqttBridge {
                 this.energyValues[variable.name] = (this.restoredEnergy[variable.name] || 0) + (this.energyValues[variable.name] || 0);
             });
             this.energyRestored = true;
-            console.log('Energy counters restored:', this.restoredEnergy);
+            log.info('Energy counters restored:', this.restoredEnergy);
         }, ENERGY_RESTORE_MS);
     }
 
@@ -218,7 +250,7 @@ class PlcMqttBridge {
 
     setupMqttSubscriptions() {
         if (!config.writeEnabled) {
-            console.log('Writing to PLC is disabled (write_enabled: false), not subscribing to command topics');
+            log.info('Writing to PLC is disabled (write_enabled: false), not subscribing to command topics');
             return;
         }
 
@@ -226,9 +258,9 @@ class PlcMqttBridge {
             const commandTopic = this.commandTopic(variable);
             this.mqttClient.subscribe(commandTopic, (err) => {
                 if (err) {
-                    console.error(`Error subscribing to ${commandTopic}:`, err);
+                    log.error(`Error subscribing to ${commandTopic}:`, err);
                 } else {
-                    console.log(`Subscribed to ${commandTopic}`);
+                    log.debug(`Subscribed to ${commandTopic}`);
                 }
             });
         });
@@ -237,19 +269,19 @@ class PlcMqttBridge {
     handleMqttCommand(topic, payload, packet) {
         // A retained command would be replayed on every reconnect and silently rewrite the PLC
         if (packet && packet.retain) {
-            console.warn(`Ignoring retained command on ${topic}: ${payload}`);
+            log.warn(`Ignoring retained command on ${topic}: ${payload}`);
             return;
         }
 
         const variable = config.variables.find(v => this.commandTopic(v) === topic);
         if (!variable || !isWritable(variable)) {
-            console.warn(`Ignoring command for non-writable topic ${topic}`);
+            log.warn(`Ignoring command for non-writable topic ${topic}`);
             return;
         }
 
         const plcValue = this.convertCommandValue(variable, payload.trim());
         if (plcValue === undefined) {
-            console.error(`Rejected invalid value '${payload}' for ${variable.name} (type ${variable.type}, min ${variable.min}, max ${variable.max})`);
+            log.error(`Rejected invalid value '${payload}' for ${variable.name} (type ${variable.type}, min ${variable.min}, max ${variable.max})`);
             return;
         }
 
@@ -257,7 +289,7 @@ class PlcMqttBridge {
         clearTimeout(this.pendingWrites[variable.name]);
         this.pendingWrites[variable.name] = setTimeout(() => {
             delete this.pendingWrites[variable.name];
-            console.log(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
+            log.info(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
             this.sendPlcCommand(`SET:${variable.name},${plcValue}`);
 
             // Read the value back so Home Assistant shows what the PLC really holds
@@ -308,9 +340,9 @@ class PlcMqttBridge {
             { retain: true, qos: 1 },
             (err) => {
                 if (err) {
-                    console.error(`Error publishing ${label} discovery message for ${variableName}:`, err);
+                    log.error(`Error publishing ${label} discovery message for ${variableName}:`, err);
                 } else {
-                    console.log(`Successfully published ${label} discovery message for ${variableName}`);
+                    log.debug(`Successfully published ${label} discovery message for ${variableName}`);
                 }
             }
         );
@@ -319,8 +351,7 @@ class PlcMqttBridge {
     sendMqttDiscoveryMessages() {
         [...config.variables, ...config.webVariables].forEach(variable => {
             // Sanitize variable name for MQTT discovery topic
-            const sanitizedName = variable.name
-            .replace(/[^a-zA-Z0-9-_]/g, '_');  // For MQTT topic (strict)
+            const sanitizedName = sanitizeName(variable.name);
 
             const component = componentFor(variable);
             const stateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
@@ -453,7 +484,7 @@ class PlcMqttBridge {
         }
 
         if (!this.mqttConnected) {
-            console.log('MQTT not connected, unable to publish:', variable.name, value);
+            log.debug('MQTT not connected, unable to publish:', variable.name, value);
             return;
         }
 
@@ -466,9 +497,9 @@ class PlcMqttBridge {
             { retain: true, qos: 1 },
             (err) => {
                 if (err) {
-                    console.error(`Error publishing state to ${stateTopic}:`, err);
+                    log.error(`Error publishing state to ${stateTopic}:`, err);
                 } else {
-                    console.log(`Successfully published state to ${stateTopic}: ${stateValue}`);
+                    log.debug(`Successfully published state to ${stateTopic}: ${stateValue}`);
                 }
             }
         );
@@ -497,13 +528,13 @@ class PlcMqttBridge {
     }
 
     setupPlc() {
-        console.log('Setting up PLC connection...');
+        log.info('Setting up PLC connection...');
         this.connectPlc();
 
         // Reconnection logic
         setInterval(() => {
             if (!this.plcConnected) {
-                console.log('Attempting to reconnect to PLC...');
+                log.info('Attempting to reconnect to PLC...');
                 this.connectPlc();
             }
         }, 5000);
@@ -513,7 +544,7 @@ class PlcMqttBridge {
             if (!this.plcConnected) return;
             const silentFor = Date.now() - this.lastPlcResponse;
             if (silentFor > this.plcRequestTimeout()) {
-                console.error(`PLC did not answer for ${Math.round(silentFor / 1000)} s, reconnecting`);
+                log.error(`PLC did not answer for ${Math.round(silentFor / 1000)} s, reconnecting`);
                 this.plcConnection.destroy();
                 this.markPlcDisconnected();
                 return;
@@ -573,7 +604,7 @@ class PlcMqttBridge {
         if (res.status !== 302 || /LOGIN/i.test(res.location)) {
             throw new Error(`PLC web login failed (HTTP ${res.status} ${res.location})`);
         }
-        console.log('Logged in to PLC web interface');
+        log.info('Logged in to PLC web interface');
     }
 
     async fetchWebPage(page) {
@@ -601,11 +632,11 @@ class PlcMqttBridge {
                         if (match) {
                             this.publishToMqtt(variable, match[1]);
                         } else {
-                            console.warn(`Web input ${variable.input} not found on ${page}`);
+                            log.warn(`Web input ${variable.input} not found on ${page}`);
                         }
                     });
                 } catch (error) {
-                    console.error(`Error reading PLC web page ${page}:`, error.message);
+                    log.error(`Error reading PLC web page ${page}:`, error.message);
                     this.webCookie = null;
                     allOk = false;
                 }
@@ -627,7 +658,7 @@ class PlcMqttBridge {
         this.plcConnection.setTimeout(10000);
 
         this.plcConnection.on('connect', () => {
-            console.log('Connected to PLC');
+            log.info('Connected to PLC');
             this.plcConnection.setTimeout(0);
             this.plcConnection.setKeepAlive(true, 10000);
             this.plcConnected = true;
@@ -638,7 +669,7 @@ class PlcMqttBridge {
         });
 
         this.plcConnection.on('timeout', () => {
-            console.error('PLC connection attempt timed out');
+            log.error('PLC connection attempt timed out');
             this.plcConnection.destroy();
             this.markPlcDisconnected();
         });
@@ -654,24 +685,24 @@ class PlcMqttBridge {
                     if (response.trim()) this.handlePlcResponse(response);
                 });
             } catch (error) {
-                console.error('Error processing PLC data:', error);
+                log.error('Error processing PLC data:', error);
             }
         });
 
         this.plcConnection.on('close', () => {
-            console.log('PLC connection closed');
+            log.info('PLC connection closed');
             this.markPlcDisconnected();
         });
 
         this.plcConnection.on('error', (error) => {
-            console.error('PLC Error:', error);
+            log.error('PLC Error:', error);
             this.markPlcDisconnected();
         });
 
         try {
             this.plcConnection.connect(config.plc.port, config.plc.host);
         } catch (error) {
-            console.error('Error connecting to PLC:', error);
+            log.error('Error connecting to PLC:', error);
         }
     }
 
@@ -693,14 +724,14 @@ class PlcMqttBridge {
 
     sendPlcCommand(command) {
         if (!this.plcConnected) {
-            console.log('PLC not connected, cannot send command:', command);
+            log.debug('PLC not connected, cannot send command:', command);
             return;
         }
 
         try {
             this.plcConnection.write(iconv.encode(command + '\r\n', 'win1250'));
         } catch (error) {
-            console.error('Error sending PLC command:', error);
+            log.error('Error sending PLC command:', error);
             this.markPlcDisconnected();
         }
     }
@@ -709,7 +740,7 @@ class PlcMqttBridge {
         // Values may contain ':' or ',' (strings, TIME), so split only on the first separator
         const methodEnd = response.indexOf(':');
         if (methodEnd < 0) {
-            console.log('Invalid PLC response format:', response);
+            log.info('Invalid PLC response format:', response);
             return;
         }
         const method = response.slice(0, methodEnd);
@@ -721,7 +752,7 @@ class PlcMqttBridge {
                 try {
                     const valueStart = params.indexOf(',');
                     if (valueStart < 0) {
-                        console.log('Invalid variable/value format:', params);
+                        log.debug('Invalid variable/value format:', params);
                         return;
                     }
                     const variableName = params.slice(0, valueStart);
@@ -733,28 +764,39 @@ class PlcMqttBridge {
                     if (configVar) {
                         this.publishToMqtt(configVar, value);
                     } else {
-                        console.log(`Unmatched variable: ${variableName}`);
+                        log.debug(`Unmatched variable: ${variableName}`);
                     }
                 } catch (error) {
-                    console.error('Error handling PLC response:', error);
+                    log.error('Error handling PLC response:', error);
                 }
                 break;
             case 'EN':
                 // Acknowledgement of a push subscription
                 break;
             case 'ERROR':
-                console.error('PLC Error:', params);
+                log.error('PLC Error:', params);
                 break;
             case 'WARNING':
-                console.warn('PLC Warning:', params);
+                log.warn('PLC Warning:', params);
                 break;
             default:
-                console.log('Unhandled PLC response:', response);
+                log.debug('Unhandled PLC response:', response);
                 break;
         }
     }
 }
 
 // Start the bridge
-console.log('Starting PLC-MQTT Bridge...');
+log.info('Starting PLC-MQTT Bridge...');
 const bridge = new PlcMqttBridge();
+
+// A clean stop does not trigger the MQTT last will, so announce offline explicitly
+const shutdown = (signal) => {
+    log.info(`Received ${signal}, shutting down`);
+    const exit = () => process.exit(0);
+    setTimeout(exit, 2000);
+    if (!bridge.mqttConnected) return exit();
+    bridge.mqttClient.publish(statusTopic('bridge'), 'offline', { retain: true, qos: 1 }, () => bridge.mqttClient.end(false, exit));
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

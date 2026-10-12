@@ -1,8 +1,17 @@
 {
-    "name": "ha-foxtrot-bridge",
-    "version": "1.0.0",
-    "dependencies": {
-      "mqtt": "^5.3.0",
-      "iconv-lite": "^0.4.24"
-    }
+  "name": "ha-foxtrot-bridge",
+  "version": "1.6.0",
+  "private": true,
+  "description": "Bridge between Tecomat Foxtrot PLC (PLCComS) and Home Assistant using MQTT",
+  "main": "plc-mqtt-bridge.js",
+  "scripts": {
+    "test": "node test/harness.js plc-mqtt-bridge.js true && node test/harness.js plc-mqtt-bridge.js false"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.6.3",
+    "mqtt": "^5.10.0"
+  },
+  "devDependencies": {
+    "aedes": "^0.51.3"
   }
+}

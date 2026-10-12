@@ -13,6 +13,7 @@
 | `mqtt_topic` | string | Base MQTT topic for all messages (default: "plc/foxtrot") |
 | `refresh_interval` | number | Heartbeat to the PLC and web page polling interval (seconds). The PLC is considered offline after 3 missed heartbeats |
 | `resync_interval` | number | Optional, default 60. Full re-read of all variables (seconds); changes in between arrive immediately as PLCComS `DIFF` pushes |
+| `log_level` | string | Optional, default `info`. One of `error`, `warning`, `info`, `debug`; per-message logs (every published value) only appear at `debug` |
 | `write_enabled` | boolean | Optional, default `true`. Master switch for writing to the PLC. When `false`, `switch`/`number` variables are exposed read-only and no command topics are subscribed |
 | `variables` | list | List of PLC variables to monitor (see Variables Configuration) |
 
@@ -88,6 +89,7 @@ mqtt_user: "MQTTUSER"
 mqtt_password: "MQTTPWD"
 mqtt_topic: "plc/foxtrot"
 refresh_interval: 10
+log_level: info
 write_enabled: true
 variables:
   # Power measurements with energy calculation
@@ -138,6 +140,11 @@ variables:
 - Consider using MQTT over TLS if accessing from outside your network
 - Keep your PLC firmware up to date
 - Restrict PLC access to trusted network segments
+
+## Notes
+
+- Variable names must stay unique after replacing non-alphanumeric characters with `_` (`A.B` and `A_B` collide); the bridge refuses to start otherwise.
+- Supported architectures: `aarch64`, `amd64`.
 
 ## Troubleshooting
 
