@@ -48,7 +48,10 @@ All entities are announced in one retained MQTT device discovery message, `homea
 ## Availability
 
 The bridge publishes `<mqtt_topic>/bridge/status` (with an MQTT last will), `<mqtt_topic>/plc/status` and
-`<mqtt_topic>/web/status` (`online`/`offline`). Every entity is unavailable in Home Assistant when the bridge
+`<mqtt_topic>/web/status` (`online`/`offline`).
+The PLC counts as offline also while its program is stopped (`__PLC_RUN = 0`, e.g. during a download from Mosaic);
+when it starts again, the bridge waits 2 s and re-subscribes and re-reads all variables, since a new program may come
+with a new public file. Every entity is unavailable in Home Assistant when the bridge
 or its data source is down, instead of showing the last retained value.
 
 ## Energy

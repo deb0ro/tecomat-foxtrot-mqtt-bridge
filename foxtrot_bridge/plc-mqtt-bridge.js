@@ -27,6 +27,7 @@ const FLOAT_TYPES = ['REAL', 'LREAL'];
 
 // PLCComS heartbeat variable, always present in the public file
 const HEARTBEAT_VARIABLE = '__PLC_RUN';
+const PLC_RESTART_DELAY_MS = 2000;
 const WRITE_DEBOUNCE_MS = 1000;
 const ENERGY_RESTORE_MS = 3000;
 
@@ -187,7 +188,7 @@ class PlcMqttBridge {
             log.info('Connected to MQTT broker');
             this.mqttConnected = true;
             this.mqttClient.publish(statusTopic('bridge'), 'online', { retain: true, qos: 1 });
-            this.publishSourceStatus('plc', this.plcConnected, true);
+            this.publishSourceStatus('plc', this.plcConnected && this.plcRunning !== false, true);
             // Web status is only known after the first poll; publishing it earlier would flash offline
             if (config.webVariables.length && this.sourceStatus.web !== null) {
                 this.publishSourceStatus('web', this.sourceStatus.web, true);
@@ -737,9 +738,11 @@ class PlcMqttBridge {
             this.plcConnection.setTimeout(0);
             this.plcConnection.setKeepAlive(true, 10000);
             this.plcConnected = true;
+            this.plcRunning = null;
             this.lastPlcResponse = Date.now();
-            this.publishSourceStatus('plc', true);
+            // 'online' is published once the first __PLC_RUN answer confirms the program runs
             this.sendPlcCommand('GETINFO:version_plc');
+            this.sendPlcCommand(`GET:${HEARTBEAT_VARIABLE}`);
             this.enablePushUpdates();
             this.requestPlcUpdates();
         });
@@ -785,6 +788,33 @@ class PlcMqttBridge {
     markPlcDisconnected() {
         this.plcConnected = false;
         this.publishSourceStatus('plc', false);
+    }
+
+    // __PLC_RUN is 0 while the program is stopped (e.g. during a download from Mosaic); the TCP session may survive it
+    handlePlcRun(value) {
+        const running = Number.parseInt(value) === 1;
+        const previous = this.plcRunning;
+        this.plcRunning = running;
+        if (previous === running) return;
+
+        if (!running) {
+            log.warn('PLC program is stopped (__PLC_RUN = 0), marking PLC entities unavailable');
+            this.publishSourceStatus('plc', false);
+            return;
+        }
+        if (previous === false) {
+            // A new program may come with a new public file, so subscriptions and values are rebuilt from scratch
+            log.info(`PLC program started again (__PLC_RUN 0 -> 1), resubscribing in ${PLC_RESTART_DELAY_MS / 1000} s`);
+            clearTimeout(this.plcRestartTimer);
+            this.plcRestartTimer = setTimeout(() => {
+                if (!this.plcConnected || !this.plcRunning) return;
+                this.enablePushUpdates();
+                this.requestPlcUpdates();
+                this.publishSourceStatus('plc', true);
+            }, PLC_RESTART_DELAY_MS);
+            return;
+        }
+        this.publishSourceStatus('plc', true);
     }
 
     enablePushUpdates() {
@@ -847,7 +877,10 @@ class PlcMqttBridge {
                     }
                     const variableName = params.slice(0, valueStart);
                     const value = params.slice(valueStart + 1);
-                    if (variableName.toUpperCase() === HEARTBEAT_VARIABLE) return;
+                    if (variableName.toUpperCase() === HEARTBEAT_VARIABLE) {
+                        this.handlePlcRun(value);
+                        return;
+                    }
 
                     // PLCComS names are case-insensitive
                     const configVar = config.variables.find(v => v.name.toUpperCase() === variableName.toUpperCase());

@@ -202,6 +202,18 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         const energy2 = Number.parseFloat(msgs['plc/foxtrot/AC_EON.L123_KW/energy/state']);
         check('energy keeps increasing', energy2 > energy, `${energy} -> ${energy2}`);
 
+        // PLC program stop/start (e.g. download from Mosaic) while the PLCComS session stays open
+        plcVars['__PLC_RUN'] = '0';
+        await wait(2000);
+        check('stopped program -> plc status offline', msgs['plc/foxtrot/plc/status'] === 'offline', msgs['plc/foxtrot/plc/status']);
+        const enBefore = plcLog.filter(l => l.startsWith('EN:')).length;
+        plcVars['__PLC_RUN'] = '1';
+        await wait(1500);
+        check('restart waits before resubscribing', plcLog.filter(l => l.startsWith('EN:')).length === enBefore);
+        await wait(2500);
+        check('program running again -> resubscribed and online', plcLog.filter(l => l.startsWith('EN:')).length >= enBefore + variables.length
+            && msgs['plc/foxtrot/plc/status'] === 'online', `EN ${enBefore} -> ${plcLog.filter(l => l.startsWith('EN:')).length}, status ${msgs['plc/foxtrot/plc/status']}`);
+
         // Watchdog: a PLC that stops answering is detected and the connection is rebuilt
         const connectsBefore = (bridgeOut.match(/Connected to PLC/g) || []).length;
         silent = true;
