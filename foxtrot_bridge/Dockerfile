@@ -1,4 +1,6 @@
-ARG BUILD_FROM
+ARG BUILD_ARCH=aarch64
+# Newer Supervisor no longer passes BUILD_FROM, fall back to the official base image
+ARG BUILD_FROM=ghcr.io/home-assistant/${BUILD_ARCH}-base:latest
 FROM $BUILD_FROM
 
 # Install required packages
