@@ -108,10 +108,42 @@ const config = {
     interval: (parseInt(options.refresh_interval) || 5) * 1000, // Convert to milliseconds with fallback
     // Full re-read of all PLCComS variables; changes in between arrive as DIFF pushes
     resyncInterval: Math.max(parseInt(options.resync_interval) || 60, 10) * 1000,
+    // Thermostats composed of configured variables (room temperature, writable setpoint, heating indicator)
+    climates: (options.climates || []).map(climate => ({
+        id: climate.id,
+        name: climate.name,
+        icon: climate.icon,
+        currentTemperature: climate.current_temperature,
+        targetTemperature: climate.target_temperature,
+        heatingWhenPositive: climate.heating_when_positive,
+        min: parseOptionalNumber(climate.min),
+        max: parseOptionalNumber(climate.max),
+        step: parseOptionalNumber(climate.step),
+    })),
 };
 
 if (!config.plc.host || !config.plc.port || !config.mqtt.host || !config.mqtt.port) {
     log.error('Missing plc_host, plc_port, mqtt_host or mqtt_port in', OPTIONS_PATH);
+    process.exit(1);
+}
+
+const findVariable = (name) => [...config.variables, ...config.webVariables].find(v => v.name === name);
+
+// A thermostat only wires existing variables together, so every reference must resolve at start
+for (const climate of config.climates) {
+    const problems = [];
+    if (!/^[a-z0-9_]+$/.test(climate.id || '')) problems.push(`id '${climate.id}' must be lowercase letters, digits or _`);
+    if (!findVariable(climate.currentTemperature)) problems.push(`current_temperature '${climate.currentTemperature}' is not a configured variable`);
+    const target = config.variables.find(v => v.name === climate.targetTemperature);
+    if (!target || target.entity !== 'number') problems.push(`target_temperature '${climate.targetTemperature}' must be a configured variable with entity: number`);
+    if (climate.heatingWhenPositive && !findVariable(climate.heatingWhenPositive)) problems.push(`heating_when_positive '${climate.heatingWhenPositive}' is not a configured variable`);
+    if (problems.length) {
+        log.error(`Climate '${climate.name || climate.id}':`, problems.join('; '));
+        process.exit(1);
+    }
+}
+if (new Set(config.climates.map(c => c.id)).size !== config.climates.length) {
+    log.error('Climate ids must be unique');
     process.exit(1);
 }
 
@@ -148,6 +180,8 @@ const componentFor = (variable) => {
 
 const statusTopic = (part) => `${config.mqtt.baseTopic}/${part}/status`;
 const energyTopic = (variable) => `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
+const stateTopic = (name) => `${config.mqtt.baseTopic}/${name}/state`;
+const climateTopic = (climate, part) => `${config.mqtt.baseTopic}/climate/${climate.id}/${part}`;
 
 class PlcMqttBridge {
     constructor() {
@@ -462,7 +496,56 @@ class PlcMqttBridge {
                 };
             }
         });
+
+        config.climates.forEach(climate => {
+            const target = config.variables.find(v => v.name === climate.targetTemperature);
+            const uniqueId = `plc_${climate.id}_climate`;
+            const entity = {
+                p: 'climate',
+                unique_id: uniqueId,
+                name: climate.name || climate.id,
+                // The setpoint is written through the target variable, so the PLC must be reachable
+                availability: [{ topic: statusTopic('bridge') }, { topic: statusTopic('plc') }],
+                availability_mode: 'all',
+                modes: ['heat'],
+                mode_state_topic: climateTopic(climate, 'mode'),
+                current_temperature_topic: stateTopic(climate.currentTemperature),
+                temperature_state_topic: stateTopic(target.name),
+                min_temp: climate.min ?? target.min ?? 7,
+                max_temp: climate.max ?? target.max ?? 35,
+                temp_step: climate.step ?? target.step ?? 0.5,
+                precision: 0.1,
+                temperature_unit: 'C',
+            };
+            if (isWritable(target)) {
+                entity.temperature_command_topic = this.commandTopic(target);
+            }
+            if (climate.heatingWhenPositive) {
+                entity.action_topic = climateTopic(climate, 'action');
+            }
+            if (climate.icon) {
+                entity.icon = climate.icon;
+            }
+            components[uniqueId] = entity;
+        });
         return components;
+    }
+
+    publishClimateModes() {
+        // Only heating is supported; the mode is fixed so Home Assistant does not show the thermostat as off
+        config.climates.forEach(climate => {
+            this.mqttClient.publish(climateTopic(climate, 'mode'), 'heat', { retain: true, qos: 1 });
+        });
+    }
+
+    // Heating is on while the indicator (e.g. the heating-curve correction) is above zero
+    publishClimateActions(variable, value) {
+        config.climates
+            .filter(climate => climate.heatingWhenPositive === variable.name)
+            .forEach(climate => {
+                const action = Number.parseFloat(value) > 0 ? 'heating' : 'idle';
+                this.mqttClient.publish(climateTopic(climate, 'action'), action, { retain: true, qos: 1 });
+            });
     }
 
     publishRetained(topic, payload) {
@@ -493,6 +576,7 @@ class PlcMqttBridge {
 
     async announceDevice(firstRun) {
         const components = this.componentConfigs();
+        this.publishClimateModes();
         if (!firstRun) {
             await this.publishDevicePayload(components);
             return;
@@ -579,6 +663,8 @@ class PlcMqttBridge {
                 }
             }
         );
+
+        this.publishClimateActions(variable, value);
 
         if (variable.calculateEnergy && this.energyRestored) {
             const roundedEnergyValue = this.energyValues[variable.name].toFixed(3);

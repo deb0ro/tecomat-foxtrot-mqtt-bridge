@@ -17,6 +17,7 @@ const plcVars = {
     'AC_EON.L123_KW': '2.000000',
     'USERDATA.ZONY.ZONY[1].JMENO': '"Přízemí"',
     'USERDATA.VENTIL': '42.000000',
+    'KOREKCE': '3.000000',
 };
 const plcLog = [];
 const sockets = new Set();
@@ -79,7 +80,10 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         { name: 'AC_EON.L123_KW', type: 'REAL', unitOfMeasurement: 'kW', calculateEnergy: true },
         { name: 'USERDATA.ZONY.ZONY[1].JMENO', type: 'STRING[48]' },
         { name: 'USERDATA.VENTIL', type: 'REAL', unitOfMeasurement: '%', friendlyName: 'Ventil', icon: 'mdi:valve' },
+        { name: 'KOREKCE', type: 'REAL', unitOfMeasurement: '°C' },
     ];
+    const climates = [{ id: 'zona1_prizemi', name: 'Přízemí', current_temperature: 'TEPLOTY.VENKU',
+        target_temperature: 'USERDATA.TUV_TC.T_KOMFORT', heating_when_positive: 'KOREKCE' }];
 
     // Retained leftovers from a "previous run": a stale command and an energy total to restore
     const pre = mqtt.connect('mqtt://127.0.0.1:11883');
@@ -90,8 +94,11 @@ plc.listen(15010, () => broker.listen(11883, async () => {
     // and a device payload that still lists a variable which is no longer configured
     const device = { identifiers: ['plc_foxtrot_bridge'], name: 'PLC Foxtrot Bridge' };
     const legacyTopic = 'homeassistant/sensor/TEPLOTY_VENKU/config';
-    const foreignTopic = 'homeassistant/climate/plc_zona1_prizemi/config';
-    const foreignPayload = JSON.stringify({ name: 'Přízemí', unique_id: 'plc_zona1_prizemi_climate', device });
+    const foreignTopic = 'homeassistant/climate/other_climate/config';
+    const foreignPayload = JSON.stringify({ name: 'Jiný', unique_id: 'other_climate', device });
+    // The hand-made thermostat of earlier days, now taken over by the climates option
+    const legacyClimateTopic = 'homeassistant/climate/plc_zona1_prizemi/config';
+    await new Promise(r => pre.publish(legacyClimateTopic, JSON.stringify({ name: 'Přízemí', unique_id: 'plc_zona1_prizemi_climate', device }), { retain: true, qos: 1 }, r));
     await new Promise(r => pre.publish(legacyTopic, JSON.stringify({ name: 'TEPLOTY.VENKU', unique_id: 'plc_TEPLOTY_VENKU_sensor', device }), { retain: true, qos: 1 }, r));
     await new Promise(r => pre.publish(foreignTopic, foreignPayload, { retain: true, qos: 1 }, r));
     await new Promise(r => pre.publish('homeassistant/device/plc_foxtrot_bridge/config', JSON.stringify({ device, origin: { name: 'x' },
@@ -104,7 +111,7 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         fs.writeFileSync(file, JSON.stringify({
             plc_host: '127.0.0.1', plc_port: 15010, mqtt_host: '127.0.0.1', mqtt_port: 11883,
             mqtt_user: 'u', mqtt_password: 'p', mqtt_topic: 'plc/foxtrot', refresh_interval: 1, resync_interval: 30,
-            log_level: 'info', write_enabled: writeEnabled === 'true', variables, web_variables: [], ...extra,
+            log_level: 'info', write_enabled: writeEnabled === 'true', variables, web_variables: [], climates, ...extra,
         }));
         return file;
     };
@@ -127,6 +134,7 @@ plc.listen(15010, () => broker.listen(11883, async () => {
     if (writeEnabled === 'false') {
         check('write disabled: number exposed as sensor', comp('plc_USERDATA_TUV_TC_T_KOMFORT_sensor')?.p === 'sensor' && !comp('plc_USERDATA_TUV_TC_T_KOMFORT_number'));
         check('write disabled: switch exposed as binary_sensor', comp('plc_USERDATA_TUV_TC_ZAP_binary_sensor')?.p === 'binary_sensor');
+        check('write disabled: climate has no command topic', comp('plc_zona1_prizemi_climate') && !comp('plc_zona1_prizemi_climate').temperature_command_topic);
         client.publish('plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set', '50');
         await wait(2000);
         check('write disabled: no SET sent', setCount() === 0, plcLog.filter(l => l.startsWith('SET')).join(';'));
@@ -152,6 +160,17 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         const jmeno = comp('plc_USERDATA_ZONY_ZONY_1__JMENO_sensor');
         check('text value has no state_class or unit', jmeno && jmeno.state_class === undefined && jmeno.unit_of_measurement === undefined, JSON.stringify(jmeno));
         check('text value published unquoted', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state'] === 'Přízemí', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state']);
+        // Thermostat built from configured variables
+        const climate = comp('plc_zona1_prizemi_climate');
+        check('climate discovery', climate?.p === 'climate' && climate.temperature_command_topic === 'plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set'
+            && climate.current_temperature_topic === 'plc/foxtrot/TEPLOTY.VENKU/state' && climate.temperature_state_topic === 'plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/state'
+            && climate.min_temp === 40 && climate.max_temp === 60 && climate.temp_step === 0.5 && climate.action_topic === 'plc/foxtrot/climate/zona1_prizemi/action', JSON.stringify(climate));
+        check('climate mode published', msgs['plc/foxtrot/climate/zona1_prizemi/mode'] === 'heat');
+        check('positive indicator -> heating', msgs['plc/foxtrot/climate/zona1_prizemi/action'] === 'heating', msgs['plc/foxtrot/climate/zona1_prizemi/action']);
+        changePlc('KOREKCE', '-1.500000');
+        await wait(300);
+        check('negative indicator -> idle', msgs['plc/foxtrot/climate/zona1_prizemi/action'] === 'idle', msgs['plc/foxtrot/climate/zona1_prizemi/action']);
+        check('hand-made climate topic taken over', JSON.stringify(history[legacyClimateTopic]?.slice(-2)) === JSON.stringify(['{"migrate_discovery":true}', '']), JSON.stringify(history[legacyClimateTopic]));
         check('energy entity in device discovery', comp('plc_AC_EON_L123_KW_energy')?.state_class === 'total_increasing');
 
         // Push updates
@@ -247,7 +266,10 @@ plc.listen(15010, () => broker.listen(11883, async () => {
 
         // Names that collide after sanitizing are rejected at start
         const dup = spawnSync('node', [process.argv[2]], { env: { ...process.env, OPTIONS_PATH: writeOptions({
-            variables: [{ name: 'A.B', type: 'REAL' }, { name: 'A_B', type: 'REAL' }] }) }, timeout: 5000 });
+            variables: [{ name: 'A.B', type: 'REAL' }, { name: 'A_B', type: 'REAL' }], climates: [] }) }, timeout: 5000 });
+        const badClimate = spawnSync('node', [process.argv[2]], { env: { ...process.env, OPTIONS_PATH: writeOptions({
+            climates: [{ id: 'x', name: 'X', current_temperature: 'NOPE', target_temperature: 'TEPLOTY.VENKU' }] }) }, timeout: 5000 });
+        check('climate with bad references rejected', badClimate.status === 1 && /NOPE.*not a configured variable.*entity: number/.test(String(badClimate.stderr)), String(badClimate.stderr).trim());
         check('colliding names rejected', dup.status === 1 && /same entity id/.test(String(dup.stderr)), String(dup.stderr).trim());
     }
 

@@ -35,6 +35,31 @@ Each variable in the `variables` list requires:
 | `friendlyName` | string | No | Entity name shown in Home Assistant (default: the PLC variable name) |
 | `icon` | string | No | Entity icon, e.g. `mdi:valve` |
 
+## Thermostats (`climates`)
+
+A thermostat (`climate` entity) is composed of variables that are already configured:
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `id` | Yes | Lowercase id (`a-z`, `0-9`, `_`); the entity's unique id is `plc_<id>_climate` |
+| `name` | Yes | Entity name |
+| `current_temperature` | Yes | Variable (PLCComS or web) with the room temperature |
+| `target_temperature` | Yes | PLCComS variable with `entity: number`; writes go through it (range check, debounce) |
+| `heating_when_positive` | No | Variable that is above zero while heating runs (e.g. heating-curve correction); the bridge publishes `heating`/`idle` |
+| `min` / `max` / `step` | No | Default to the target variable's range |
+| `icon` | No | Entity icon |
+
+```yaml
+climates:
+  - id: zona1_prizemi
+    name: "Přízemí"
+    current_temperature: TEPLOTY.Z1_PROSTOR
+    target_temperature: USERDATA.ZONY.ZONY[1].POZ_DEN
+    heating_when_positive: WEB.ZONA1.KOREKCE_EQT
+```
+
+The only mode is `heat`. A thermostat that was published by hand under the same unique id is taken over on start.
+
 ## Home Assistant discovery
 
 All entities are announced in one retained MQTT device discovery message, `homeassistant/device/plc_foxtrot_bridge/config`

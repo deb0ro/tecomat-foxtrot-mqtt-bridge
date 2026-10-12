@@ -1,5 +1,5 @@
 name: "Tecomat Foxtrot Bridge"
-version: "1.8.0"
+version: "1.9.0"
 slug: "foxtrot_bridge"
 description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
 url: "https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge"
@@ -31,6 +31,7 @@ options:
       unitOfMeasurement: 'kW'
       calculateEnergy: true
   web_variables: []
+  climates: []
 schema:
   plc_host: str
   plc_port: port
@@ -71,3 +72,13 @@ schema:
       entity: list(sensor|binary_sensor)?
       deviceClass: str?
       stateClass: list(measurement|total|total_increasing)?
+  climates:
+    - id: match(^[a-z0-9_]+$)
+      name: str
+      icon: str?
+      current_temperature: str
+      target_temperature: str
+      heating_when_positive: str?
+      min: float?
+      max: float?
+      step: float?
