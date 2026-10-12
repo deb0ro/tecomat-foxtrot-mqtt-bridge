@@ -1,5 +1,5 @@
 name: "Tecomat Foxtrot Bridge"
-version: "1.9.0"
+version: "1.10.0"
 slug: "foxtrot_bridge"
 description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
 url: "https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge"
@@ -69,7 +69,10 @@ schema:
       input: match(^__T[0-9A-Fa-f]{8}$)
       type: str
       unitOfMeasurement: str?
-      entity: list(sensor|binary_sensor)?
+      entity: list(sensor|binary_sensor|switch|number)?
+      min: float?
+      max: float?
+      step: float?
       deviceClass: str?
       stateClass: list(measurement|total|total_increasing)?
   climates:

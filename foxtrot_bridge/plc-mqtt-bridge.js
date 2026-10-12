@@ -97,14 +97,25 @@ const config = {
         user: options.web_user || '',
         password: options.web_password || '',
     },
-    webVariables: (options.web_variables || []).map(variable => ({
-        ...commonVariableOptions(variable),
-        source: 'web',
-        page: variable.page,
-        input: variable.input,
-        entity: (variable.entity || 'sensor').toLowerCase() === 'binary_sensor' ? 'binary_sensor' : 'sensor',
-        calculateEnergy: false,
-    })),
+    webVariables: (options.web_variables || []).map(variable => {
+        let entity = (variable.entity || 'sensor').toLowerCase();
+        if (!SUPPORTED_ENTITIES.includes(entity)) {
+            log.warn(`Unsupported entity '${entity}' for ${variable.name}, falling back to sensor`);
+            entity = 'sensor';
+        }
+        return {
+            ...commonVariableOptions(variable),
+            source: 'web',
+            page: variable.page,
+            input: variable.input,
+            // switch / number are written the way the PLC web UI does it: a form POST to the same page
+            entity,
+            min: parseOptionalNumber(variable.min),
+            max: parseOptionalNumber(variable.max),
+            step: parseOptionalNumber(variable.step),
+            calculateEnergy: false,
+        };
+    }),
     interval: (parseInt(options.refresh_interval) || 5) * 1000, // Convert to milliseconds with fallback
     // Full re-read of all PLCComS variables; changes in between arrive as DIFF pushes
     resyncInterval: Math.max(parseInt(options.resync_interval) || 60, 10) * 1000,
@@ -191,6 +202,7 @@ class PlcMqttBridge {
         this.lastPlcResponse = 0;
         this.sourceStatus = { plc: null, web: null };
         this.pendingWrites = {};
+        this.webInputNames = {};
         this.lastValues = {};
         this.lastUpdateTime = {};
         this.energyValues = {};
@@ -307,7 +319,7 @@ class PlcMqttBridge {
             return;
         }
 
-        config.variables.filter(isWritable).forEach(variable => {
+        [...config.variables, ...config.webVariables].filter(isWritable).forEach(variable => {
             const commandTopic = this.commandTopic(variable);
             this.mqttClient.subscribe(commandTopic, (err) => {
                 if (err) {
@@ -326,7 +338,7 @@ class PlcMqttBridge {
             return;
         }
 
-        const variable = config.variables.find(v => this.commandTopic(v) === topic);
+        const variable = [...config.variables, ...config.webVariables].find(v => this.commandTopic(v) === topic);
         if (!variable || !isWritable(variable)) {
             log.warn(`Ignoring command for non-writable topic ${topic}`);
             return;
@@ -343,6 +355,10 @@ class PlcMqttBridge {
         this.pendingWrites[variable.name] = setTimeout(() => {
             delete this.pendingWrites[variable.name];
             log.info(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
+            if (variable.source === 'web') {
+                this.writeWebVariable(variable, plcValue).catch(error => log.error(`Writing ${variable.name} via PLC web failed:`, error.message));
+                return;
+            }
             this.sendPlcCommand(`SET:${variable.name},${plcValue}`);
 
             // Read the value back so Home Assistant shows what the PLC really holds
@@ -779,6 +795,25 @@ class PlcMqttBridge {
         return res.body;
     }
 
+    // Same request the PLC web UI sends when a button is clicked: POST <page> with encodeURIComponent("<input>=<value>")
+    async writeWebVariable(variable, value) {
+        const inputName = this.webInputNames[variable.name];
+        if (!inputName) {
+            throw new Error(`input ${variable.input} not read from ${variable.page} yet`);
+        }
+        const body = encodeURIComponent(`${inputName}=${value}`);
+        let res = await this.webRequest('POST', `/${variable.page}`, body);
+        if ((res.status === 302 && /LOGIN/i.test(res.location)) || /<LOGIN>/.test(res.body)) {
+            await this.webLogin();
+            res = await this.webRequest('POST', `/${variable.page}`, body);
+        }
+        if (res.status >= 400) {
+            throw new Error(`PLC web returned HTTP ${res.status}`);
+        }
+        // Read the page back so Home Assistant shows what the PLC really holds
+        setTimeout(() => this.pollWebPages(), 1000);
+    }
+
     async pollWebPages() {
         if (this.webPolling) return;
         this.webPolling = true;
@@ -790,9 +825,11 @@ class PlcMqttBridge {
                     const body = await this.fetchWebPage(page);
                     config.webVariables.filter(v => v.page === page).forEach(variable => {
                         // Inputs are named <hash>_<TYPE>_<format>; the same hash may repeat with another format
-                        const match = new RegExp(`<INPUT NAME="${variable.input}_[^"]*" VALUE="([^"]*)"`).exec(body);
+                        const match = new RegExp(`<INPUT NAME="(${variable.input}_[^"]*)" VALUE="([^"]*)"`).exec(body);
                         if (match) {
-                            this.publishToMqtt(variable, match[1]);
+                            // The full name (with type suffix) is what a form POST has to send back
+                            this.webInputNames[variable.name] = match[1];
+                            this.publishToMqtt(variable, match[2]);
                         } else {
                             log.warn(`Web input ${variable.input} not found on ${page}`);
                         }

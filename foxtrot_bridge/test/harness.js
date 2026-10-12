@@ -4,6 +4,8 @@ const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
 const mqtt = require('mqtt');
 const iconv = require('iconv-lite');
 const aedes = require('aedes')();
@@ -63,6 +65,41 @@ const plc = net.createServer(sock => {
     });
 });
 
+// Fake PLC web server: SoftPLC cookie login and a page with the vacation button
+const webVars = { '__T39B76846_BOOL_i': '0' };
+const webLog = [];
+let webAuthed = false;
+const web = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+        const cookieOk = /SoftPLC=12345/.test(req.headers.cookie || '');
+        if (req.url === '/SYSWWW/LOGIN.XML' && req.method === 'GET') {
+            res.writeHead(200, { 'Set-Cookie': 'SoftPLC=12345; Path=/' });
+            return res.end('<LOGIN><USER VALUE=""/></LOGIN>');
+        }
+        if (req.url === '/SYSWWW/LOGIN.XML' && req.method === 'POST') {
+            webAuthed = cookieOk && body === 'USER=&PASS=' + crypto.createHash('sha1').update('12345').digest('hex');
+            res.writeHead(302, { Location: webAuthed ? '/MTABLET.XML' : '/SYSWWW/LOGIN.XML' });
+            return res.end();
+        }
+        if (!webAuthed || !cookieOk) {
+            res.writeHead(302, { Location: '/SYSWWW/LOGIN.XML' });
+            return res.end();
+        }
+        if (req.url === '/MTABLET.XML' && req.method === 'POST') {
+            webLog.push(body);
+            const [name, value] = decodeURIComponent(body).split('=');
+            webVars[name] = value;
+            res.writeHead(200);
+            return res.end('<PAGE/>');
+        }
+        res.writeHead(200, { 'Content-Type': 'text/xml' });
+        res.end('<?xml version="1.0" encoding="windows-1250" ?><PAGE>' +
+            Object.entries(webVars).map(([n, v]) => `<INPUT NAME="${n}" VALUE="${v}" />`).join('') + '</PAGE>');
+    });
+});
+
 const changePlc = (name, value) => { plcVars[name] = value; sockets.forEach(s => s.pushDiff(name)); };
 
 const broker = net.createServer(aedes.handle);
@@ -70,7 +107,7 @@ const results = [];
 const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ' — ' + detail : ''}`); };
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-plc.listen(15010, () => broker.listen(11883, async () => {
+plc.listen(15010, () => broker.listen(11883, () => web.listen(18080, async () => {
     const writeEnabled = process.argv[3] || 'true';
     const variables = [
         { name: 'TEPLOTY.VENKU', type: 'REAL', unitOfMeasurement: '°C' },
@@ -111,7 +148,8 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         fs.writeFileSync(file, JSON.stringify({
             plc_host: '127.0.0.1', plc_port: 15010, mqtt_host: '127.0.0.1', mqtt_port: 11883,
             mqtt_user: 'u', mqtt_password: 'p', mqtt_topic: 'plc/foxtrot', refresh_interval: 1, resync_interval: 30,
-            log_level: 'info', write_enabled: writeEnabled === 'true', variables, web_variables: [], climates, ...extra,
+            log_level: 'info', write_enabled: writeEnabled === 'true', variables, climates, web_port: 18080,
+            web_variables: [{ name: 'WEB.DOVOLENA', page: 'MTABLET.XML', input: '__T39B76846', type: 'BOOL', entity: 'switch', friendlyName: 'Dovolená' }], ...extra,
         }));
         return file;
     };
@@ -137,6 +175,10 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         check('write disabled: climate has no command topic', comp('plc_zona1_prizemi_climate') && !comp('plc_zona1_prizemi_climate').temperature_command_topic);
         client.publish('plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set', '50');
         await wait(2000);
+        check('write disabled: web switch exposed as binary_sensor', comp('plc_WEB_DOVOLENA_binary_sensor')?.p === 'binary_sensor');
+        client.publish('plc/foxtrot/WEB.DOVOLENA/set', 'ON');
+        await wait(1500);
+        check('write disabled: no web POST', webLog.length === 0, webLog.join(';'));
         check('write disabled: no SET sent', setCount() === 0, plcLog.filter(l => l.startsWith('SET')).join(';'));
     } else {
         // Availability
@@ -160,6 +202,22 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         const jmeno = comp('plc_USERDATA_ZONY_ZONY_1__JMENO_sensor');
         check('text value has no state_class or unit', jmeno && jmeno.state_class === undefined && jmeno.unit_of_measurement === undefined, JSON.stringify(jmeno));
         check('text value published unquoted', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state'] === 'Přízemí', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state']);
+        // Web switch: written like the PLC web UI button (form POST)
+        const ws = comp('plc_WEB_DOVOLENA_switch');
+        check('web switch discovery', ws?.command_topic === 'plc/foxtrot/WEB.DOVOLENA/set' && ws.availability?.[1]?.topic === 'plc/foxtrot/web/status' && ws.name === 'Dovolená', JSON.stringify(ws));
+        check('web switch state OFF', msgs['plc/foxtrot/WEB.DOVOLENA/state'] === 'OFF', msgs['plc/foxtrot/WEB.DOVOLENA/state']);
+        client.publish('plc/foxtrot/WEB.DOVOLENA/set', 'ON');
+        await wait(3000);
+        check('web switch POSTs like the UI button', JSON.stringify(webLog) === JSON.stringify(['__T39B76846_BOOL_i%3D1']), JSON.stringify(webLog));
+        check('web switch state read back ON', msgs['plc/foxtrot/WEB.DOVOLENA/state'] === 'ON', msgs['plc/foxtrot/WEB.DOVOLENA/state']);
+        webAuthed = false;
+        client.publish('plc/foxtrot/WEB.DOVOLENA/set', 'OFF');
+        await wait(3000);
+        check('web write logs in again after session loss', webLog[webLog.length - 1] === '__T39B76846_BOOL_i%3D0' && msgs['plc/foxtrot/WEB.DOVOLENA/state'] === 'OFF', JSON.stringify(webLog));
+        client.publish('plc/foxtrot/WEB.DOVOLENA/set', 'maybe');
+        await wait(1500);
+        check('invalid web command rejected', webLog.length === 2);
+
         // Thermostat built from configured variables
         const climate = comp('plc_zona1_prizemi_climate');
         check('climate discovery', climate?.p === 'climate' && climate.temperature_command_topic === 'plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set'
@@ -273,9 +331,9 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         check('colliding names rejected', dup.status === 1 && /same entity id/.test(String(dup.stderr)), String(dup.stderr).trim());
     }
 
-    bridge.kill(); client.end(true); plc.close(); broker.close(); aedes.close();
+    bridge.kill(); client.end(true); plc.close(); broker.close(); aedes.close(); web.close();
     sockets.forEach(s => s.destroy());
     if (results.includes(false)) { console.log('--- bridge output tail ---\n' + bridgeOut.split('\n').slice(-40).join('\n')); }
     console.log(results.includes(false) ? 'SOME TESTS FAILED' : 'ALL PASSED');
     process.exit(results.includes(false) ? 1 : 0);
-}));
+})));

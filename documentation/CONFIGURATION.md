@@ -113,10 +113,15 @@ the PLCComS public file. `web_variables` reads them read-only from the PLC web s
 | `web_variables[].page` | string | Page XML, e.g. `MUZONA1.XML` |
 | `web_variables[].input` | string | Input hash from the page source, e.g. `__T17573290` (the `_TYPE_format` suffix is ignored) |
 | `web_variables[].type` | string | `REAL`, `BOOL`, ... |
-| `web_variables[].entity` | string | `sensor` (default) or `binary_sensor` |
+| `web_variables[].entity` | string | `sensor` (default), `binary_sensor`, or writable `switch` / `number` |
+| `web_variables[].min` / `max` / `step` | number | Range for a writable `number` |
 | `web_variables[].friendlyName` / `icon` / `deviceClass` / `stateClass` | string | Same as for `variables` |
 
 Find the hash by opening the page in a browser and viewing its source (`view-source:http://<plc>/MUZONA1.XML`).
+Writable web variables (`switch`, `number`) are written exactly like a click in the PLC web UI: a form POST to the
+same page with `encodeURIComponent("<input name with type suffix>=<value>")`, e.g. `__T39B76846_BOOL_i%3D1`. The page
+is read back after 1 s. Use this only for buttons the web UI offers; the PLC program reacts as if the button was pressed.
+
 The bridge logs in the same way as the browser (`PASS = sha1(SoftPLC cookie + password)`) and re-logs on session expiry.
 
 ## Full Configuration Example
