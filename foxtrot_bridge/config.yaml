@@ -1,5 +1,5 @@
 name: "Tecomat Foxtrot Bridge"
-version: "1.6.0"
+version: "1.7.0"
 slug: "foxtrot_bridge"
 description: "Bridge between Tecomat Foxtrot PLC and Home Assistant using MQTT"
 url: "https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge"
@@ -45,6 +45,8 @@ schema:
   write_enabled: bool?
   variables:
     - name: str
+      friendlyName: str?
+      icon: str?
       type: str
       unitOfMeasurement: str?
       calculateEnergy: bool?
@@ -60,6 +62,8 @@ schema:
   web_password: password?
   web_variables:
     - name: str
+      friendlyName: str?
+      icon: str?
       page: str
       input: match(^__T[0-9A-Fa-f]{8}$)
       type: str

@@ -30,19 +30,33 @@ const HEARTBEAT_VARIABLE = '__PLC_RUN';
 const WRITE_DEBOUNCE_MS = 1000;
 const ENERGY_RESTORE_MS = 3000;
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 const parseOptionalNumber = (value) => {
     const parsed = Number.parseFloat(value);
     return Number.isFinite(parsed) ? parsed : undefined;
 };
 
+// One device discovery topic carries every entity, so removed variables can be cleaned up
+const DEVICE_ID = 'plc_foxtrot_bridge';
+const DEVICE_TOPIC = `homeassistant/device/${DEVICE_ID}/config`;
+const DISCOVERY_SCAN_MS = 2000;
+const DISCOVERY_STEP_MS = 1000;
+const PACKAGE = require('./package.json');
+
 // Options shared by PLCComS and web variables
 const commonVariableOptions = (variable) => ({
     name: variable.name,
+    friendlyName: variable.friendlyName,
+    icon: variable.icon,
     type: (variable.type || 'REAL').toUpperCase(),
     unitOfMeasurement: variable.unitOfMeasurement || '',
     deviceClass: variable.deviceClass,
     stateClass: variable.stateClass,
 });
+
+// Text-like PLC types have no numeric state, so they must not get a state_class
+const isTextType = (type) => type.startsWith('STRING') || ['TIME', 'DATE', 'TOD', 'DT', 'DATE_AND_TIME', 'TIME_OF_DAY'].includes(type);
 
 const config = {
     plc: {
@@ -179,11 +193,15 @@ class PlcMqttBridge {
                 this.publishSourceStatus('web', this.sourceStatus.web, true);
             }
             this.restoreEnergyCounters();
-            this.sendMqttDiscoveryMessages();
+            this.announceDevice(!this.discoveryDone).catch(error => log.error('MQTT discovery failed:', error));
             this.setupMqttSubscriptions();
         });
 
         this.mqttClient.on('message', (topic, payload, packet) => {
+            if (this.retainedScan && topic.startsWith('homeassistant/')) {
+                this.retainedScan[topic] = payload.toString();
+                return;
+            }
             if (topic.endsWith('/energy/state')) {
                 this.handleEnergyRestore(topic, payload.toString());
                 return;
@@ -319,11 +337,17 @@ class PlcMqttBridge {
     }
 
     deviceInfo() {
-        return {
-            identifiers: ['plc_foxtrot_bridge'],
+        const device = {
+            identifiers: [DEVICE_ID],
             name: 'PLC Foxtrot Bridge',
-            manufacturer: 'Custom Integration'
+            manufacturer: 'Teco a.s.',
+            model: this.plcInfo?.model || 'Tecomat Foxtrot',
+            configuration_url: `http://${config.plc.host}/`,
         };
+        if (this.plcInfo?.firmware) {
+            device.sw_version = this.plcInfo.firmware;
+        }
+        return device;
     }
 
     availability(variable) {
@@ -333,132 +357,183 @@ class PlcMqttBridge {
         };
     }
 
-    publishDiscovery(topic, message, variableName, label) {
-        this.mqttClient.publish(
-            topic,
-            message === null ? '' : JSON.stringify(message),
-            { retain: true, qos: 1 },
-            (err) => {
-                if (err) {
-                    log.error(`Error publishing ${label} discovery message for ${variableName}:`, err);
-                } else {
-                    log.debug(`Successfully published ${label} discovery message for ${variableName}`);
-                }
-            }
-        );
+    defaultDeviceClass(unit) {
+        switch (unit) {
+            case 'kW':
+            case 'W':
+            case 'MW':
+            case 'GW':
+                return 'power';
+            case 'kWh':
+            case 'Wh':
+                return 'energy';
+            case '°C':
+            case '℃':
+                return 'temperature';
+            case 'h':
+            case 'min':
+            case 's':
+                return 'duration';
+            case 'V':
+                return 'voltage';
+            case 'A':
+                return 'current';
+            // '%' is deliberately unmapped: valve positions and duty cycles are not humidity
+            default:
+                return null;
+        }
     }
 
-    sendMqttDiscoveryMessages() {
+    // Discovery config of every entity, keyed by unique_id (used as the component id)
+    componentConfigs() {
+        const components = {};
         [...config.variables, ...config.webVariables].forEach(variable => {
-            // Sanitize variable name for MQTT discovery topic
             const sanitizedName = sanitizeName(variable.name);
-
             const component = componentFor(variable);
-            const stateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
+            const deviceClass = variable.deviceClass || this.defaultDeviceClass(variable.unitOfMeasurement);
+            const uniqueId = `plc_${sanitizedName}_${component}`;
 
-            // Determine appropriate device class based on unit of measurement
-            let deviceClass = null;
-
-            switch(variable.unitOfMeasurement) {
-                case 'kW':
-                case 'W':
-                case 'MW':
-                case 'GW':
-                    deviceClass = "power";
-                    break;
-                case 'kWh':
-                case 'Wh':
-                    deviceClass = "energy";
-                    break;
-                case '°C':
-                case '℃':
-                    deviceClass = "temperature";
-                    break;
-                case 'h':
-                case 'min':
-                case 's':
-                    deviceClass = "duration";
-                    break;
-                case '%':
-                    deviceClass = "humidity";
-                    break;
-                case 'V':
-                    deviceClass = "voltage";
-                    break;
-                case 'A':
-                    deviceClass = "current";
-                    break;
-                // Add more mappings as needed
-            }
-            if (variable.deviceClass) {
-                deviceClass = variable.deviceClass;
-            }
-
-            const discoveryMessage = {
-                name: `${variable.name}`,
-                state_topic: stateTopic,
-                unique_id: `plc_${sanitizedName}_${component}`,
-                device: this.deviceInfo(),
+            const entity = {
+                p: component,
+                unique_id: uniqueId,
+                name: variable.friendlyName || variable.name,
+                state_topic: `${config.mqtt.baseTopic}/${variable.name}/state`,
                 ...this.availability(variable),
             };
+            if (variable.icon) {
+                entity.icon = variable.icon;
+            }
 
             switch (component) {
                 case 'sensor':
-                    discoveryMessage.unit_of_measurement = variable.unitOfMeasurement;
-                    if (deviceClass) {
-                        discoveryMessage.device_class = deviceClass;
+                    if (variable.unitOfMeasurement) {
+                        entity.unit_of_measurement = variable.unitOfMeasurement;
                     }
-                    discoveryMessage.state_class = variable.stateClass || (deviceClass === 'energy' ? 'total_increasing' : 'measurement');
+                    if (deviceClass) {
+                        entity.device_class = deviceClass;
+                    }
+                    if (variable.stateClass) {
+                        entity.state_class = variable.stateClass;
+                    } else if (!isTextType(variable.type)) {
+                        entity.state_class = deviceClass === 'energy' ? 'total_increasing' : 'measurement';
+                    }
                     break;
                 case 'binary_sensor':
-                    discoveryMessage.payload_on = 'ON';
-                    discoveryMessage.payload_off = 'OFF';
+                    entity.payload_on = 'ON';
+                    entity.payload_off = 'OFF';
+                    if (variable.deviceClass) {
+                        entity.device_class = variable.deviceClass;
+                    }
                     break;
                 case 'switch':
-                    discoveryMessage.command_topic = this.commandTopic(variable);
-                    discoveryMessage.payload_on = 'ON';
-                    discoveryMessage.payload_off = 'OFF';
+                    entity.command_topic = this.commandTopic(variable);
+                    entity.payload_on = 'ON';
+                    entity.payload_off = 'OFF';
                     break;
                 case 'number':
-                    discoveryMessage.command_topic = this.commandTopic(variable);
-                    discoveryMessage.mode = 'box';
-                    discoveryMessage.min = variable.min ?? -1000000;
-                    discoveryMessage.max = variable.max ?? 1000000;
-                    discoveryMessage.step = variable.step ?? (INTEGER_TYPES.includes(variable.type) ? 1 : 0.1);
+                    entity.command_topic = this.commandTopic(variable);
+                    entity.mode = 'box';
+                    entity.min = variable.min ?? -1000000;
+                    entity.max = variable.max ?? 1000000;
+                    entity.step = variable.step ?? (INTEGER_TYPES.includes(variable.type) ? 1 : 0.1);
                     if (variable.unitOfMeasurement) {
-                        discoveryMessage.unit_of_measurement = variable.unitOfMeasurement;
+                        entity.unit_of_measurement = variable.unitOfMeasurement;
                     }
                     if (deviceClass === 'temperature') {
-                        discoveryMessage.device_class = deviceClass;
+                        entity.device_class = deviceClass;
                     }
                     break;
             }
-
-            this.publishDiscovery(`homeassistant/${component}/${sanitizedName}/config`, discoveryMessage, variable.name, component);
-
-            // Drop discovery left over from a previous entity type of this variable (e.g. sensor -> number)
-            SUPPORTED_ENTITIES
-                .filter(other => other !== component)
-                .forEach(other => this.publishDiscovery(`homeassistant/${other}/${sanitizedName}/config`, null, variable.name, `stale ${other}`));
+            components[uniqueId] = entity;
 
             // If calculateEnergy is true, create energy sensor
             if (variable.calculateEnergy) {
-                const energyDiscoveryTopic = `homeassistant/sensor/${sanitizedName}_energy/config`;
-
-                const energyDiscoveryMessage = {
-                    name: `${variable.name} Energy`,
+                const energyId = `plc_${sanitizedName}_energy`;
+                components[energyId] = {
+                    p: 'sensor',
+                    unique_id: energyId,
+                    name: `${variable.friendlyName || variable.name} Energy`,
                     state_topic: energyTopic(variable),
-                    unit_of_measurement: "kWh",
-                    device_class: "energy",
-                    state_class: "total_increasing",
-                    unique_id: `plc_${sanitizedName}_energy`,
-                    device: this.deviceInfo(),
+                    unit_of_measurement: 'kWh',
+                    device_class: 'energy',
+                    state_class: 'total_increasing',
                     ...this.availability(variable),
                 };
-
-                this.publishDiscovery(energyDiscoveryTopic, energyDiscoveryMessage, variable.name, 'energy');
             }
         });
+        return components;
+    }
+
+    publishRetained(topic, payload) {
+        return new Promise((resolve, reject) => {
+            this.mqttClient.publish(topic, payload, { retain: true, qos: 1 }, (err) => err ? reject(err) : resolve());
+        });
+    }
+
+    publishDevicePayload(components) {
+        return this.publishRetained(DEVICE_TOPIC, JSON.stringify({
+            device: this.deviceInfo(),
+            origin: { name: 'tecomat-foxtrot-mqtt-bridge', sw: PACKAGE.version, url: 'https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge' },
+            qos: 1,
+            components,
+        }));
+    }
+
+    // Retained messages arrive right after subscribing; collect them for a short while
+    async collectRetained(topics) {
+        this.retainedScan = {};
+        await new Promise(resolve => this.mqttClient.subscribe(topics, resolve));
+        await sleep(DISCOVERY_SCAN_MS);
+        await new Promise(resolve => this.mqttClient.unsubscribe(topics, resolve));
+        const collected = this.retainedScan;
+        this.retainedScan = null;
+        return collected;
+    }
+
+    async announceDevice(firstRun) {
+        const components = this.componentConfigs();
+        if (!firstRun) {
+            await this.publishDevicePayload(components);
+            return;
+        }
+
+        const retained = await this.collectRetained(['homeassistant/+/+/config', DEVICE_TOPIC]);
+        const parse = (payload) => {
+            try { return JSON.parse(payload); } catch { return null; }
+        };
+
+        // Single-component topics of this bridge's own entities move into the device topic.
+        // Topics with other unique ids (e.g. a hand-made climate on the same device) are left alone.
+        const legacyTopics = Object.entries(retained)
+            .filter(([topic, payload]) => topic !== DEVICE_TOPIC && payload && components[parse(payload)?.unique_id])
+            .map(([topic]) => topic);
+        for (const topic of legacyTopics) {
+            await this.publishRetained(topic, JSON.stringify({ migrate_discovery: true }));
+        }
+        if (legacyTopics.length) {
+            log.info(`Migrating ${legacyTopics.length} single-entity discovery topics to ${DEVICE_TOPIC}`);
+            await sleep(DISCOVERY_STEP_MS);
+        }
+
+        // Entities announced last time but no longer configured are removed in two steps (platform only, then omitted)
+        const previous = parse(retained[DEVICE_TOPIC])?.components || parse(retained[DEVICE_TOPIC])?.cmps || {};
+        const removed = Object.entries(previous).filter(([id, entity]) => !components[id] && (entity.p || entity.platform));
+        if (removed.length) {
+            log.info('Removing entities no longer configured:', removed.map(([id]) => id).join(', '));
+            await this.publishDevicePayload({ ...components, ...Object.fromEntries(removed.map(([id, entity]) => [id, { p: entity.p || entity.platform }])) });
+            await sleep(DISCOVERY_STEP_MS);
+        }
+
+        await this.publishDevicePayload(components);
+        log.info(`Published discovery for ${Object.keys(components).length} entities`);
+
+        if (legacyTopics.length) {
+            await sleep(DISCOVERY_STEP_MS);
+            for (const topic of legacyTopics) {
+                await this.publishRetained(topic, '');
+            }
+        }
+        this.discoveryDone = true;
     }
 
     formatStateValue(variable, value) {
@@ -664,6 +739,7 @@ class PlcMqttBridge {
             this.plcConnected = true;
             this.lastPlcResponse = Date.now();
             this.publishSourceStatus('plc', true);
+            this.sendPlcCommand('GETINFO:version_plc');
             this.enablePushUpdates();
             this.requestPlcUpdates();
         });
@@ -736,6 +812,20 @@ class PlcMqttBridge {
         }
     }
 
+    // GETINFO:VERSION_PLC,CP2975I s B 2.7 2.3.062 -> model CP2975I, firmware 2.7 (2.3.062)
+    handlePlcInfo(params) {
+        const match = /^VERSION_PLC,(\S+)\s+(.*)$/i.exec(params.trim());
+        if (!match) return;
+        const versions = match[2].trim().split(/\s+/).filter(part => /^\d+(\.\d+)+$/.test(part));
+        const info = { model: match[1], firmware: versions.length > 1 ? `${versions[0]} (${versions.slice(1).join(' ')})` : (versions[0] || match[2].trim()) };
+        if (this.plcInfo?.model === info.model && this.plcInfo?.firmware === info.firmware) return;
+        this.plcInfo = info;
+        log.info(`PLC ${info.model}, firmware ${info.firmware}`);
+        if (this.mqttConnected && this.discoveryDone) {
+            this.publishDevicePayload(this.componentConfigs()).catch(error => log.error('MQTT discovery failed:', error));
+        }
+    }
+
     handlePlcResponse(response) {
         // Values may contain ':' or ',' (strings, TIME), so split only on the first separator
         const methodEnd = response.indexOf(':');
@@ -772,6 +862,9 @@ class PlcMqttBridge {
                 break;
             case 'EN':
                 // Acknowledgement of a push subscription
+                break;
+            case 'GETINFO':
+                this.handlePlcInfo(params);
                 break;
             case 'ERROR':
                 log.error('PLC Error:', params);

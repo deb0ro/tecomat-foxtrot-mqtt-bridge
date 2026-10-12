@@ -15,6 +15,8 @@ const plcVars = {
     'USERDATA.TUV_TC.ZAP': '1',
     'USERDATA.ZONY.ZONY[1].FC_DOVOLENA': '0',
     'AC_EON.L123_KW': '2.000000',
+    'USERDATA.ZONY.ZONY[1].JMENO': '"Přízemí"',
+    'USERDATA.VENTIL': '42.000000',
 };
 const plcLog = [];
 const sockets = new Set();
@@ -45,6 +47,8 @@ const plc = net.createServer(sock => {
             } else if (cmd === 'EN') {
                 const key = findKey(rest.split(' ')[0]);
                 if (key) { sock.subscribed.add(key); out.push(`DIFF:${key},${plcVars[key]}`); }
+            } else if (cmd === 'GETINFO') {
+                out.push('GETINFO:VERSION_PLC,CP2975I s B 2.7 2.3.062', 'GETINFO:');
             } else if (cmd === 'SET') {
                 const i = rest.indexOf(','); const key = findKey(rest.slice(0, i));
                 plcVars[key] = rest.slice(i + 1);
@@ -73,6 +77,8 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         { name: 'USERDATA.TUV_TC.ZAP', type: 'BOOL', entity: 'switch' },
         { name: 'USERDATA.ZONY.ZONY[1].FC_DOVOLENA', type: 'BOOL', entity: 'binary_sensor' },
         { name: 'AC_EON.L123_KW', type: 'REAL', unitOfMeasurement: 'kW', calculateEnergy: true },
+        { name: 'USERDATA.ZONY.ZONY[1].JMENO', type: 'STRING[48]' },
+        { name: 'USERDATA.VENTIL', type: 'REAL', unitOfMeasurement: '%', friendlyName: 'Ventil', icon: 'mdi:valve' },
     ];
 
     // Retained leftovers from a "previous run": a stale command and an energy total to restore
@@ -80,6 +86,16 @@ plc.listen(15010, () => broker.listen(11883, async () => {
     await new Promise(r => pre.on('connect', r));
     await new Promise(r => pre.publish('plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set', '45', { retain: true, qos: 1 }, r));
     await new Promise(r => pre.publish('plc/foxtrot/AC_EON.L123_KW/energy/state', '100.000', { retain: true, qos: 1 }, r));
+    // Discovery left by older versions: a single-entity topic of our own, a foreign entity on the same device,
+    // and a device payload that still lists a variable which is no longer configured
+    const device = { identifiers: ['plc_foxtrot_bridge'], name: 'PLC Foxtrot Bridge' };
+    const legacyTopic = 'homeassistant/sensor/TEPLOTY_VENKU/config';
+    const foreignTopic = 'homeassistant/climate/plc_zona1_prizemi/config';
+    const foreignPayload = JSON.stringify({ name: 'Přízemí', unique_id: 'plc_zona1_prizemi_climate', device });
+    await new Promise(r => pre.publish(legacyTopic, JSON.stringify({ name: 'TEPLOTY.VENKU', unique_id: 'plc_TEPLOTY_VENKU_sensor', device }), { retain: true, qos: 1 }, r));
+    await new Promise(r => pre.publish(foreignTopic, foreignPayload, { retain: true, qos: 1 }, r));
+    await new Promise(r => pre.publish('homeassistant/device/plc_foxtrot_bridge/config', JSON.stringify({ device, origin: { name: 'x' },
+        components: { plc_OLD_VAR_sensor: { p: 'sensor', unique_id: 'plc_OLD_VAR_sensor', state_topic: 'x' } } }), { retain: true, qos: 1 }, r));
     pre.end();
 
     // The bridge reads Supervisor-style options from OPTIONS_PATH
@@ -97,17 +113,20 @@ plc.listen(15010, () => broker.listen(11883, async () => {
     bridge.stdout.on('data', d => bridgeOut += d); bridge.stderr.on('data', d => bridgeOut += d);
 
     const msgs = {};
+    const history = {};
     const client = mqtt.connect('mqtt://127.0.0.1:11883');
-    client.on('message', (t, p) => { msgs[t] = p.toString(); });
+    client.on('message', (t, p) => { msgs[t] = p.toString(); (history[t] = history[t] || []).push(p.toString()); });
     client.subscribe('#');
-    await wait(4500);
+    await wait(8000);
 
-    const disc = t => msgs[t] ? JSON.parse(msgs[t]) : undefined;
+    const deviceTopic = 'homeassistant/device/plc_foxtrot_bridge/config';
+    const deviceConfig = () => JSON.parse(msgs[deviceTopic]);
+    const comp = id => deviceConfig().components[id];
     const setCount = () => plcLog.filter(l => l.startsWith('SET')).length;
 
     if (writeEnabled === 'false') {
-        check('write disabled: number exposed as sensor', !!disc('homeassistant/sensor/USERDATA_TUV_TC_T_KOMFORT/config') && !msgs['homeassistant/number/USERDATA_TUV_TC_T_KOMFORT/config']);
-        check('write disabled: switch exposed as binary_sensor', !!disc('homeassistant/binary_sensor/USERDATA_TUV_TC_ZAP/config'));
+        check('write disabled: number exposed as sensor', comp('plc_USERDATA_TUV_TC_T_KOMFORT_sensor')?.p === 'sensor' && !comp('plc_USERDATA_TUV_TC_T_KOMFORT_number'));
+        check('write disabled: switch exposed as binary_sensor', comp('plc_USERDATA_TUV_TC_ZAP_binary_sensor')?.p === 'binary_sensor');
         client.publish('plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set', '50');
         await wait(2000);
         check('write disabled: no SET sent', setCount() === 0, plcLog.filter(l => l.startsWith('SET')).join(';'));
@@ -115,8 +134,25 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         // Availability
         check('bridge status online', msgs['plc/foxtrot/bridge/status'] === 'online');
         check('plc status online', msgs['plc/foxtrot/plc/status'] === 'online');
-        const sensorDisc = disc('homeassistant/sensor/TEPLOTY_VENKU/config');
+        const sensorDisc = comp('plc_TEPLOTY_VENKU_sensor');
         check('discovery carries availability', sensorDisc?.availability?.length === 2 && sensorDisc.availability_mode === 'all', JSON.stringify(sensorDisc?.availability));
+
+        // Device discovery
+        const dev = deviceConfig();
+        check('device info from GETINFO', dev.device.manufacturer === 'Teco a.s.' && dev.device.model === 'CP2975I' && dev.device.sw_version === '2.7 (2.3.062)'
+            && dev.device.configuration_url === 'http://127.0.0.1/', JSON.stringify(dev.device));
+        check('origin carries package version', dev.origin?.sw === require('../package.json').version);
+        check('legacy topic migrated then cleared', JSON.stringify(history[legacyTopic]?.slice(-2)) === JSON.stringify(['{"migrate_discovery":true}', '']), JSON.stringify(history[legacyTopic]));
+        check('foreign entity on the device left alone', msgs[foreignTopic] === foreignPayload);
+        const removal = (history[deviceTopic] || []).map(x => JSON.parse(x)).find(x => x.components?.plc_OLD_VAR_sensor && Object.keys(x.components.plc_OLD_VAR_sensor).length === 1);
+        check('removed variable: platform-only step then omitted', removal?.components.plc_OLD_VAR_sensor.p === 'sensor' && !comp('plc_OLD_VAR_sensor'));
+        check('no per-entity discovery topics any more', !Object.keys(msgs).some(t => /^homeassistant\/(sensor|number|switch|binary_sensor)\//.test(t) && msgs[t]));
+        const ventil = comp('plc_USERDATA_VENTIL_sensor');
+        check('% is not humidity; friendlyName and icon applied', ventil?.device_class === undefined && ventil.name === 'Ventil' && ventil.icon === 'mdi:valve', JSON.stringify(ventil));
+        const jmeno = comp('plc_USERDATA_ZONY_ZONY_1__JMENO_sensor');
+        check('text value has no state_class or unit', jmeno && jmeno.state_class === undefined && jmeno.unit_of_measurement === undefined, JSON.stringify(jmeno));
+        check('text value published unquoted', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state'] === 'Přízemí', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].JMENO/state']);
+        check('energy entity in device discovery', comp('plc_AC_EON_L123_KW_energy')?.state_class === 'total_increasing');
 
         // Push updates
         check('EN: sent for every variable', variables.every(v => plcLog.some(l => l.startsWith(`EN:${v.name}`))));
@@ -132,7 +168,7 @@ plc.listen(15010, () => broker.listen(11883, async () => {
         check('heartbeat polls __PLC_RUN', plcLog.some(l => l === 'GET:__PLC_RUN'));
 
         // Discovery of writable entities
-        const n = disc('homeassistant/number/USERDATA_TUV_TC_T_KOMFORT/config');
+        const n = comp('plc_USERDATA_TUV_TC_T_KOMFORT_number');
         check('number discovery', n?.command_topic === 'plc/foxtrot/USERDATA.TUV_TC.T_KOMFORT/set' && n.min === 40 && n.max === 60 && n.step === 0.5);
         check('switch state ON', msgs['plc/foxtrot/USERDATA.TUV_TC.ZAP/state'] === 'ON');
         check('binary_sensor state OFF', msgs['plc/foxtrot/USERDATA.ZONY.ZONY[1].FC_DOVOLENA/state'] === 'OFF');

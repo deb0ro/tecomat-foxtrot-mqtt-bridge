@@ -31,7 +31,19 @@ Each variable in the `variables` list requires:
 | `min` / `max` | number | No | Allowed range for `number`. Commands outside the range are rejected and never reach the PLC |
 | `step` | number | No | Step for `number` (default 0.1, or 1 for integer types) |
 | `delta` | number | No | Smallest change pushed by PLCComS (default 0.05 for REAL/LREAL, 0 otherwise) |
-| `deviceClass` / `stateClass` | string | No | Override the Home Assistant device class / state class |
+| `deviceClass` / `stateClass` | string | No | Override the Home Assistant device class / state class. Default device class follows the unit (kW→power, kWh→energy, °C→temperature, h→duration, V, A); `%` has none. Text types (STRING, TIME, …) get no state class |
+| `friendlyName` | string | No | Entity name shown in Home Assistant (default: the PLC variable name) |
+| `icon` | string | No | Entity icon, e.g. `mdi:valve` |
+
+## Home Assistant discovery
+
+All entities are announced in one retained MQTT device discovery message, `homeassistant/device/plc_foxtrot_bridge/config`
+(Home Assistant 2024.11+). The device shows the PLC model and firmware read via `GETINFO` and links to the PLC web UI.
+
+- Removing a variable from the configuration removes its entity on the next start.
+- Versions before 1.7.0 used one topic per entity. On the first start, the bridge migrates its own topics
+  (`migrate_discovery`) so entity ids, names and history are kept, then clears them. Other entities on the same
+  device that the bridge did not create (e.g. a hand-made climate) are left untouched.
 
 ## Availability
 
@@ -74,6 +86,7 @@ the PLCComS public file. `web_variables` reads them read-only from the PLC web s
 | `web_variables[].input` | string | Input hash from the page source, e.g. `__T17573290` (the `_TYPE_format` suffix is ignored) |
 | `web_variables[].type` | string | `REAL`, `BOOL`, ... |
 | `web_variables[].entity` | string | `sensor` (default) or `binary_sensor` |
+| `web_variables[].friendlyName` / `icon` / `deviceClass` / `stateClass` | string | Same as for `variables` |
 
 Find the hash by opening the page in a browser and viewing its source (`view-source:http://<plc>/MUZONA1.XML`).
 The bridge logs in the same way as the browser (`PASS = sha1(SoftPLC cookie + password)`) and re-logs on session expiry.
