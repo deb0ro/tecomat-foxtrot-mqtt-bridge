@@ -9,11 +9,26 @@ const WRITABLE_ENTITIES = ['switch', 'number'];
 const SUPPORTED_ENTITIES = ['sensor', 'binary_sensor', ...WRITABLE_ENTITIES];
 const INTEGER_TYPES = ['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD'];
 const UNSIGNED_TYPES = ['USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD'];
+const FLOAT_TYPES = ['REAL', 'LREAL'];
+
+// PLCComS heartbeat variable, always present in the public file
+const HEARTBEAT_VARIABLE = '__PLC_RUN';
+const WRITE_DEBOUNCE_MS = 1000;
+const ENERGY_RESTORE_MS = 3000;
 
 const parseOptionalNumber = (value) => {
     const parsed = Number.parseFloat(value);
     return Number.isFinite(parsed) ? parsed : undefined;
 };
+
+// Options shared by PLCComS and web variables
+const commonVariableOptions = (variable) => ({
+    name: variable.name,
+    type: (variable.type || 'REAL').toUpperCase(),
+    unitOfMeasurement: variable.unitOfMeasurement || '',
+    deviceClass: variable.deviceClass,
+    stateClass: variable.stateClass,
+});
 
 // Load configuration from environment variables
 const config = {
@@ -35,15 +50,17 @@ const config = {
             console.warn(`Unsupported entity '${entity}' for ${variable.name}, falling back to sensor`);
             entity = 'sensor';
         }
+        const type = (variable.type || 'REAL').toUpperCase();
         return {
-            name: variable.name,
-            type: (variable.type || 'REAL').toUpperCase(),
+            ...commonVariableOptions(variable),
+            source: 'plc',
             entity,
-            unitOfMeasurement: variable.unitOfMeasurement || '',
             calculateEnergy: variable.calculateEnergy || false,
             min: parseOptionalNumber(variable.min),
             max: parseOptionalNumber(variable.max),
             step: parseOptionalNumber(variable.step),
+            // Smallest change PLCComS reports as DIFF; noisy analog values would otherwise flood MQTT
+            delta: parseOptionalNumber(variable.delta) ?? (FLOAT_TYPES.includes(type) ? 0.05 : 0),
         };
     }),
     // Values that only exist on the PLC web pages (not in the PLCComS public file), read-only
@@ -53,15 +70,16 @@ const config = {
         password: process.env.WEB_PASSWORD || '',
     },
     webVariables: JSON.parse(process.env.WEB_VARIABLES || '[]').map(variable => ({
-        name: variable.name,
+        ...commonVariableOptions(variable),
+        source: 'web',
         page: variable.page,
         input: variable.input,
-        type: (variable.type || 'REAL').toUpperCase(),
         entity: (variable.entity || 'sensor').toLowerCase() === 'binary_sensor' ? 'binary_sensor' : 'sensor',
-        unitOfMeasurement: variable.unitOfMeasurement || '',
         calculateEnergy: false,
     })),
     interval: (parseInt(process.env.REFRESH_INTERVAL) || 5) * 1000, // Convert to milliseconds with fallback
+    // Full re-read of all PLCComS variables; changes in between arrive as DIFF pushes
+    resyncInterval: Math.max(parseInt(process.env.RESYNC_INTERVAL) || 60, 10) * 1000,
 };
 
 // Validate configuration
@@ -81,16 +99,21 @@ const componentFor = (variable) => {
     return variable.entity;
 };
 
+const statusTopic = (part) => `${config.mqtt.baseTopic}/${part}/status`;
+const energyTopic = (variable) => `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
+
 class PlcMqttBridge {
     constructor() {
         this.plcConnected = false;
         this.mqttConnected = false;
-        this.lastPlcRequestTimes = {};
-        this.plcRequestInterval = config.interval;
         this.plcBuffer = '';
+        this.lastPlcResponse = 0;
+        this.sourceStatus = { plc: null, web: null };
+        this.pendingWrites = {};
         this.lastValues = {};
         this.lastUpdateTime = {};
         this.energyValues = {};
+        this.energyRestored = false;
         this.setupMqtt();
         this.setupPlc();
 
@@ -110,16 +133,29 @@ class PlcMqttBridge {
             keepalive: 60,
             reconnectPeriod: 5000,
             connectTimeout: 30000,
+            // Broker marks every entity unavailable when the bridge dies without saying goodbye
+            will: { topic: statusTopic('bridge'), payload: 'offline', retain: true, qos: 1 },
         });
 
         this.mqttClient.on('connect', () => {
             console.log('Connected to MQTT broker');
             this.mqttConnected = true;
+            this.mqttClient.publish(statusTopic('bridge'), 'online', { retain: true, qos: 1 });
+            this.publishSourceStatus('plc', this.plcConnected, true);
+            // Web status is only known after the first poll; publishing it earlier would flash offline
+            if (config.webVariables.length && this.sourceStatus.web !== null) {
+                this.publishSourceStatus('web', this.sourceStatus.web, true);
+            }
+            this.restoreEnergyCounters();
             this.sendMqttDiscoveryMessages();
             this.setupMqttSubscriptions();
         });
 
         this.mqttClient.on('message', (topic, payload, packet) => {
+            if (topic.endsWith('/energy/state')) {
+                this.handleEnergyRestore(topic, payload.toString());
+                return;
+            }
             this.handleMqttCommand(topic, payload.toString(), packet);
         });
 
@@ -137,6 +173,43 @@ class PlcMqttBridge {
             console.log('MQTT client is offline');
             this.mqttConnected = false;
         });
+    }
+
+    publishSourceStatus(source, online, force = false) {
+        if (!force && this.sourceStatus[source] === online) return;
+        this.sourceStatus[source] = online;
+        if (this.mqttConnected) {
+            this.mqttClient.publish(statusTopic(source), online ? 'online' : 'offline', { retain: true, qos: 1 });
+        }
+    }
+
+    restoreEnergyCounters() {
+        // Energy totals live only in memory, so pick them up from the retained state of the last run
+        if (this.energyRestored) return;
+        const topics = config.variables.filter(v => v.calculateEnergy).map(energyTopic);
+        if (!topics.length) {
+            this.energyRestored = true;
+            return;
+        }
+        this.restoredEnergy = {};
+        this.mqttClient.subscribe(topics);
+        setTimeout(() => {
+            this.mqttClient.unsubscribe(topics);
+            config.variables.filter(v => v.calculateEnergy).forEach(variable => {
+                this.energyValues[variable.name] = (this.restoredEnergy[variable.name] || 0) + (this.energyValues[variable.name] || 0);
+            });
+            this.energyRestored = true;
+            console.log('Energy counters restored:', this.restoredEnergy);
+        }, ENERGY_RESTORE_MS);
+    }
+
+    handleEnergyRestore(topic, payload) {
+        if (this.energyRestored) return;
+        const variable = config.variables.find(v => v.calculateEnergy && energyTopic(v) === topic);
+        const value = Number.parseFloat(payload);
+        if (variable && Number.isFinite(value)) {
+            this.restoredEnergy[variable.name] = value;
+        }
     }
 
     commandTopic(variable) {
@@ -180,11 +253,16 @@ class PlcMqttBridge {
             return;
         }
 
-        console.log(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
-        this.sendPlcCommand(`SET:${variable.name},${plcValue}`);
+        // Rapid +/- clicks would each hit retentive PLC memory; only the last value within the window is written
+        clearTimeout(this.pendingWrites[variable.name]);
+        this.pendingWrites[variable.name] = setTimeout(() => {
+            delete this.pendingWrites[variable.name];
+            console.log(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
+            this.sendPlcCommand(`SET:${variable.name},${plcValue}`);
 
-        // Read the value back so Home Assistant shows what the PLC really holds
-        setTimeout(() => this.sendPlcCommand(`GET:${variable.name}`), 500);
+            // Read the value back so Home Assistant shows what the PLC really holds
+            setTimeout(() => this.sendPlcCommand(`GET:${variable.name}`), 500);
+        }, WRITE_DEBOUNCE_MS);
     }
 
     convertCommandValue(variable, payload) {
@@ -213,6 +291,13 @@ class PlcMqttBridge {
             identifiers: ['plc_foxtrot_bridge'],
             name: 'PLC Foxtrot Bridge',
             manufacturer: 'Custom Integration'
+        };
+    }
+
+    availability(variable) {
+        return {
+            availability: [{ topic: statusTopic('bridge') }, { topic: statusTopic(variable.source) }],
+            availability_mode: 'all',
         };
     }
 
@@ -250,6 +335,10 @@ class PlcMqttBridge {
                 case 'GW':
                     deviceClass = "power";
                     break;
+                case 'kWh':
+                case 'Wh':
+                    deviceClass = "energy";
+                    break;
                 case '°C':
                 case '℃':
                     deviceClass = "temperature";
@@ -270,12 +359,16 @@ class PlcMqttBridge {
                     break;
                 // Add more mappings as needed
             }
+            if (variable.deviceClass) {
+                deviceClass = variable.deviceClass;
+            }
 
             const discoveryMessage = {
                 name: `${variable.name}`,
                 state_topic: stateTopic,
                 unique_id: `plc_${sanitizedName}_${component}`,
-                device: this.deviceInfo()
+                device: this.deviceInfo(),
+                ...this.availability(variable),
             };
 
             switch (component) {
@@ -284,7 +377,7 @@ class PlcMqttBridge {
                     if (deviceClass) {
                         discoveryMessage.device_class = deviceClass;
                     }
-                    discoveryMessage.state_class = "measurement";
+                    discoveryMessage.state_class = variable.stateClass || (deviceClass === 'energy' ? 'total_increasing' : 'measurement');
                     break;
                 case 'binary_sensor':
                     discoveryMessage.payload_on = 'ON';
@@ -320,16 +413,16 @@ class PlcMqttBridge {
             // If calculateEnergy is true, create energy sensor
             if (variable.calculateEnergy) {
                 const energyDiscoveryTopic = `homeassistant/sensor/${sanitizedName}_energy/config`;
-                const energyStateTopic = `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
 
                 const energyDiscoveryMessage = {
                     name: `${variable.name} Energy`,
-                    state_topic: energyStateTopic,
+                    state_topic: energyTopic(variable),
                     unit_of_measurement: "kWh",
                     device_class: "energy",
                     state_class: "total_increasing",
                     unique_id: `plc_${sanitizedName}_energy`,
-                    device: this.deviceInfo()
+                    device: this.deviceInfo(),
+                    ...this.availability(variable),
                 };
 
                 this.publishDiscovery(energyDiscoveryTopic, energyDiscoveryMessage, variable.name, 'energy');
@@ -352,12 +445,18 @@ class PlcMqttBridge {
     }
 
     publishToMqtt(variable, value) {
+        const now = Date.now();
+
+        // Integrate before the MQTT check so an outage does not lose energy
+        if (variable.calculateEnergy) {
+            this.integrateEnergy(variable, Number.parseFloat(value), now);
+        }
+
         if (!this.mqttConnected) {
             console.log('MQTT not connected, unable to publish:', variable.name, value);
             return;
         }
 
-        const now = Date.now();
         const stateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
         const stateValue = this.formatStateValue(variable, value);
 
@@ -374,39 +473,27 @@ class PlcMqttBridge {
             }
         );
 
-        // Check if this variable should calculate energy
-        if (variable.calculateEnergy) {
-            const powerValue = Number.parseFloat(value);
-
-            // Calculate and publish energy value (kWh)
-            if (this.lastUpdateTime[variable.name] && this.lastValues[variable.name] !== undefined) {
-                const timeDiff = (now - this.lastUpdateTime[variable.name]) / 1000 / 3600; // Convert to hours
-                const avgPower = (powerValue + this.lastValues[variable.name]) / 2; // Average power over the interval
-                const energyIncrement = avgPower * timeDiff; // kWh for this interval
-
-                this.energyValues[variable.name] = (this.energyValues[variable.name] || 0) + energyIncrement;
-
-                const energyTopic = `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
-                const roundedEnergyValue = this.energyValues[variable.name].toFixed(3);
-
-                this.mqttClient.publish(
-                    energyTopic,
-                    roundedEnergyValue.toString(),
-                    { retain: true, qos: 1 },
-                    (err) => {
-                        if (err) {
-                            console.error(`Error publishing energy to ${energyTopic}:`, err);
-                        } else {
-                            console.log(`Successfully published energy to ${energyTopic}: ${roundedEnergyValue}`);
-                        }
-                    }
-                );
-            }
-
-            // Store current values for next calculation
-            this.lastValues[variable.name] = powerValue;
-            this.lastUpdateTime[variable.name] = now;
+        if (variable.calculateEnergy && this.energyRestored) {
+            const roundedEnergyValue = this.energyValues[variable.name].toFixed(3);
+            this.mqttClient.publish(energyTopic(variable), roundedEnergyValue, { retain: true, qos: 1 });
         }
+    }
+
+    integrateEnergy(variable, powerValue, now) {
+        if (!Number.isFinite(powerValue)) return;
+        const lastTime = this.lastUpdateTime[variable.name];
+        const lastPower = this.lastValues[variable.name];
+
+        // Values arrive on change (DIFF), so the previous power held until now; skip gaps after an outage
+        if (lastTime !== undefined && lastPower !== undefined && this.plcConnected) {
+            const hours = (now - lastTime) / 1000 / 3600;
+            if (hours > 0 && hours <= (config.resyncInterval * 3) / 1000 / 3600) {
+                this.energyValues[variable.name] = (this.energyValues[variable.name] || 0) + Math.max(lastPower, 0) * hours;
+            }
+        }
+
+        this.lastValues[variable.name] = powerValue;
+        this.lastUpdateTime[variable.name] = now;
     }
 
     setupPlc() {
@@ -421,19 +508,36 @@ class PlcMqttBridge {
             }
         }, 5000);
 
-        // Periodic PLC variable monitoring
+        // Heartbeat and watchdog: a half-open TCP connection never reports an error by itself
+        setInterval(() => {
+            if (!this.plcConnected) return;
+            const silentFor = Date.now() - this.lastPlcResponse;
+            if (silentFor > this.plcRequestTimeout()) {
+                console.error(`PLC did not answer for ${Math.round(silentFor / 1000)} s, reconnecting`);
+                this.plcConnection.destroy();
+                this.markPlcDisconnected();
+                return;
+            }
+            this.sendPlcCommand(`GET:${HEARTBEAT_VARIABLE}`);
+        }, config.interval);
+
+        // Periodic full re-read in case a DIFF was missed
         setInterval(() => {
             if (this.plcConnected) {
                 this.requestPlcUpdates();
             }
-        }, this.plcRequestInterval);
+        }, config.resyncInterval);
 
         if (config.webVariables.length) {
             this.webCookie = null;
             this.webPolling = false;
             this.pollWebPages();
-            setInterval(() => this.pollWebPages(), this.plcRequestInterval);
+            setInterval(() => this.pollWebPages(), config.interval);
         }
+    }
+
+    plcRequestTimeout() {
+        return config.interval * 3 + 5000;
     }
 
     webRequest(method, path, body) {
@@ -485,6 +589,7 @@ class PlcMqttBridge {
     async pollWebPages() {
         if (this.webPolling) return;
         this.webPolling = true;
+        let allOk = true;
         try {
             const pages = [...new Set(config.webVariables.map(v => v.page))];
             for (const page of pages) {
@@ -502,10 +607,12 @@ class PlcMqttBridge {
                 } catch (error) {
                     console.error(`Error reading PLC web page ${page}:`, error.message);
                     this.webCookie = null;
+                    allOk = false;
                 }
             }
         } finally {
             this.webPolling = false;
+            this.publishSourceStatus('web', allOk);
         }
     }
 
@@ -517,14 +624,27 @@ class PlcMqttBridge {
         }
         this.plcConnection = new net.Socket();
         this.plcBuffer = '';
+        this.plcConnection.setTimeout(10000);
 
         this.plcConnection.on('connect', () => {
             console.log('Connected to PLC');
+            this.plcConnection.setTimeout(0);
+            this.plcConnection.setKeepAlive(true, 10000);
             this.plcConnected = true;
-            this.lastPlcRequestTimes = {};
+            this.lastPlcResponse = Date.now();
+            this.publishSourceStatus('plc', true);
+            this.enablePushUpdates();
+            this.requestPlcUpdates();
+        });
+
+        this.plcConnection.on('timeout', () => {
+            console.error('PLC connection attempt timed out');
+            this.plcConnection.destroy();
+            this.markPlcDisconnected();
         });
 
         this.plcConnection.on('data', (data) => {
+            this.lastPlcResponse = Date.now();
             try {
                 // TCP may split or merge lines, keep the incomplete tail for the next chunk
                 this.plcBuffer += iconv.decode(data, 'win1250');
@@ -540,12 +660,12 @@ class PlcMqttBridge {
 
         this.plcConnection.on('close', () => {
             console.log('PLC connection closed');
-            this.plcConnected = false;
+            this.markPlcDisconnected();
         });
 
         this.plcConnection.on('error', (error) => {
             console.error('PLC Error:', error);
-            this.plcConnected = false;
+            this.markPlcDisconnected();
         });
 
         try {
@@ -555,19 +675,20 @@ class PlcMqttBridge {
         }
     }
 
-    requestPlcUpdates() {
-        const now = Date.now();
-        console.log('Checking for PLC updates...');
+    markPlcDisconnected() {
+        this.plcConnected = false;
+        this.publishSourceStatus('plc', false);
+    }
 
+    enablePushUpdates() {
+        // PLCComS keeps EN: per client session, so it has to be repeated after every reconnect
         config.variables.forEach(variable => {
-            const lastRequest = this.lastPlcRequestTimes[variable.name] || 0;
-            const timeSinceLastRequest = now - lastRequest;
-
-            if (timeSinceLastRequest >= this.plcRequestInterval) {
-                this.sendPlcCommand(`GET:${variable.name}`);
-                this.lastPlcRequestTimes[variable.name] = now;
-            }
+            this.sendPlcCommand(variable.delta ? `EN:${variable.name} ${variable.delta}` : `EN:${variable.name}`);
         });
+    }
+
+    requestPlcUpdates() {
+        config.variables.forEach(variable => this.sendPlcCommand(`GET:${variable.name}`));
     }
 
     sendPlcCommand(command) {
@@ -580,13 +701,11 @@ class PlcMqttBridge {
             this.plcConnection.write(iconv.encode(command + '\r\n', 'win1250'));
         } catch (error) {
             console.error('Error sending PLC command:', error);
-            this.plcConnected = false;
+            this.markPlcDisconnected();
         }
     }
 
     handlePlcResponse(response) {
-        console.log('Raw PLC response:', response);
-
         // Values may contain ':' or ',' (strings, TIME), so split only on the first separator
         const methodEnd = response.indexOf(':');
         if (methodEnd < 0) {
@@ -607,11 +726,11 @@ class PlcMqttBridge {
                     }
                     const variableName = params.slice(0, valueStart);
                     const value = params.slice(valueStart + 1);
+                    if (variableName.toUpperCase() === HEARTBEAT_VARIABLE) return;
 
                     // PLCComS names are case-insensitive
                     const configVar = config.variables.find(v => v.name.toUpperCase() === variableName.toUpperCase());
                     if (configVar) {
-                        console.log(`Processing PLC value for ${variableName}: ${value}`);
                         this.publishToMqtt(configVar, value);
                     } else {
                         console.log(`Unmatched variable: ${variableName}`);
@@ -619,6 +738,9 @@ class PlcMqttBridge {
                 } catch (error) {
                     console.error('Error handling PLC response:', error);
                 }
+                break;
+            case 'EN':
+                // Acknowledgement of a push subscription
                 break;
             case 'ERROR':
                 console.error('PLC Error:', params);

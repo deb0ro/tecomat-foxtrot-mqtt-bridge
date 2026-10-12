@@ -11,7 +11,8 @@
 | `mqtt_user` | string | MQTT username |
 | `mqtt_password` | string | MQTT password |
 | `mqtt_topic` | string | Base MQTT topic for all messages (default: "plc/foxtrot") |
-| `refresh_interval` | number | How often to read values from PLC (in seconds) |
+| `refresh_interval` | number | Heartbeat to the PLC and web page polling interval (seconds). The PLC is considered offline after 3 missed heartbeats |
+| `resync_interval` | number | Optional, default 60. Full re-read of all variables (seconds); changes in between arrive immediately as PLCComS `DIFF` pushes |
 | `write_enabled` | boolean | Optional, default `true`. Master switch for writing to the PLC. When `false`, `switch`/`number` variables are exposed read-only and no command topics are subscribed |
 | `variables` | list | List of PLC variables to monitor (see Variables Configuration) |
 
@@ -28,12 +29,26 @@ Each variable in the `variables` list requires:
 | `entity` | string | No | Home Assistant entity type: `sensor` (default), `binary_sensor`, `switch` or `number`. Only `switch` and `number` can write to the PLC |
 | `min` / `max` | number | No | Allowed range for `number`. Commands outside the range are rejected and never reach the PLC |
 | `step` | number | No | Step for `number` (default 0.1, or 1 for integer types) |
+| `delta` | number | No | Smallest change pushed by PLCComS (default 0.05 for REAL/LREAL, 0 otherwise) |
+| `deviceClass` / `stateClass` | string | No | Override the Home Assistant device class / state class |
+
+## Availability
+
+The bridge publishes `<mqtt_topic>/bridge/status` (with an MQTT last will), `<mqtt_topic>/plc/status` and
+`<mqtt_topic>/web/status` (`online`/`offline`). Every entity is unavailable in Home Assistant when the bridge
+or its data source is down, instead of showing the last retained value.
+
+## Energy
+
+`calculateEnergy` integrates power over time (the previous value is held until the next change). The total is
+restored from the retained MQTT state on start, so restarts do not reset it. Prefer a real meter when the PLC
+has one, e.g. via `web_variables` with `deviceClass: energy` and `stateClass: total_increasing`.
 
 ## Writing to the PLC
 
 Variables with `entity: switch` or `entity: number` get a command topic `<mqtt_topic>/<variable_name>/set`.
 The bridge validates the value (BOOL accepts `ON`/`OFF`/`1`/`0`, numbers are checked against `min`/`max`
-and rounded for integer types), sends `SET:<variable_name>,<value>` to PLCComS and reads the value back
+and rounded for integer types), waits 1 s so that only the last of rapid changes is written, sends `SET:<variable_name>,<value>` to PLCComS and reads the value back
 with `GET:` so Home Assistant shows what the PLC really holds.
 
 Retained messages on command topics are ignored, so a stale command is never replayed after a reconnect.
