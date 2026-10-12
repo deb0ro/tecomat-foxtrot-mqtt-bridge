@@ -22,6 +22,7 @@ MQTT_USER=$(jq -r '.mqtt_user' "$CONFIG_PATH")
 MQTT_PASSWORD=$(jq -r '.mqtt_password' "$CONFIG_PATH")
 MQTT_TOPIC=$(jq -r '.mqtt_topic' "$CONFIG_PATH")
 REFRESH_INTERVAL=$(jq -r '.refresh_interval // 5' "$CONFIG_PATH")  # Default to 5 if not set
+WRITE_ENABLED=$(jq -r 'if .write_enabled == false then "false" else "true" end' "$CONFIG_PATH")
 VARIABLES=$(jq -r '.variables' "$CONFIG_PATH")
 
 # Validate essential configuration
@@ -37,9 +38,10 @@ if ! [[ "$REFRESH_INTERVAL" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "Using refresh interval: ${REFRESH_INTERVAL} seconds"
+echo "Writing to PLC enabled: ${WRITE_ENABLED}"
 
 # Export the configuration values for the Node.js script
-export PLC_HOST PLC_PORT MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASSWORD MQTT_TOPIC REFRESH_INTERVAL VARIABLES
+export PLC_HOST PLC_PORT MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASSWORD MQTT_TOPIC REFRESH_INTERVAL WRITE_ENABLED VARIABLES
 
 # Start the Node.js application with debug logging
 exec node /app/plc-mqtt-bridge.js

@@ -12,6 +12,7 @@
 | `mqtt_password` | string | MQTT password |
 | `mqtt_topic` | string | Base MQTT topic for all messages (default: "plc/foxtrot") |
 | `refresh_interval` | number | How often to read values from PLC (in seconds) |
+| `write_enabled` | boolean | Optional, default `true`. Master switch for writing to the PLC. When `false`, `switch`/`number` variables are exposed read-only and no command topics are subscribed |
 | `variables` | list | List of PLC variables to monitor (see Variables Configuration) |
 
 ## Variables Configuration
@@ -22,8 +23,26 @@ Each variable in the `variables` list requires:
 |--------|------|----------|-------------|
 | `name` | string | Yes | Variable name exactly as defined in PLC |
 | `type` | string | Yes | Data type (e.g., "REAL", "INT", etc.) |
-| `unitOfMeasurement` | string | Yes | Unit of measurement (e.g., "kW", "°C") |
+| `unitOfMeasurement` | string | No | Unit of measurement (e.g., "kW", "°C") |
 | `calculateEnergy` | boolean | No | Enable energy calculation for power measurements |
+| `entity` | string | No | Home Assistant entity type: `sensor` (default), `binary_sensor`, `switch` or `number`. Only `switch` and `number` can write to the PLC |
+| `min` / `max` | number | No | Allowed range for `number`. Commands outside the range are rejected and never reach the PLC |
+| `step` | number | No | Step for `number` (default 0.1, or 1 for integer types) |
+
+## Writing to the PLC
+
+Variables with `entity: switch` or `entity: number` get a command topic `<mqtt_topic>/<variable_name>/set`.
+The bridge validates the value (BOOL accepts `ON`/`OFF`/`1`/`0`, numbers are checked against `min`/`max`
+and rounded for integer types), sends `SET:<variable_name>,<value>` to PLCComS and reads the value back
+with `GET:` so Home Assistant shows what the PLC really holds.
+
+Retained messages on command topics are ignored, so a stale command is never replayed after a reconnect.
+
+Only make writable what the PLC program expects to be changed from outside (setpoints, mode flags).
+PLCComS itself has no authentication, so keep the PLC on a trusted network segment.
+
+Changing a variable from `sensor` to `number` (or `binary_sensor` to `switch`) creates a new entity in
+Home Assistant; the old one is removed from MQTT discovery automatically.
 
 ## Full Configuration Example
 
@@ -36,6 +55,7 @@ mqtt_user: "MQTTUSER"
 mqtt_password: "MQTTPWD"
 mqtt_topic: "plc/foxtrot"
 refresh_interval: 10
+write_enabled: true
 variables:
   # Power measurements with energy calculation
   - name: "AC_EON.L123_KW"
@@ -56,7 +76,21 @@ variables:
   # Digital input
   - name: "DIGITAL_INPUT"
     type: "BOOL"
-    unitOfMeasurement: ""
+    entity: "binary_sensor"
+
+  # Writable setpoint
+  - name: "USERDATA.TUV_TC.T_KOMFORT"
+    type: "REAL"
+    unitOfMeasurement: "°C"
+    entity: "number"
+    min: 40
+    max: 60
+    step: 0.5
+
+  # Writable on/off flag
+  - name: "USERDATA.TUV_TC.ZAP"
+    type: "BOOL"
+    entity: "switch"
 ```
 
 ## Network Configuration

@@ -15,6 +15,7 @@ This addon enables real-time monitoring of Tecomat Foxtrot PLC variables in Home
 ## Features
 
 - 🔄 Real-time PLC variable monitoring
+- ✍️ Writing setpoints and flags back to the PLC (`switch` / `number` entities)
 - 🏠 Automatic MQTT device discovery in Home Assistant
 - ⚡ Energy monitoring support for power measurements
 - 🔌 Easy integration with Home Assistant's Energy Dashboard
@@ -26,7 +27,7 @@ This addon enables real-time monitoring of Tecomat Foxtrot PLC variables in Home
 
 1. Add this repository to your Home Assistant instance:
    ```
-   https://github.com/deb0ro/ha-foxtrot-bridge
+   https://github.com/deb0ro/tecomat-foxtrot-mqtt-bridge
    ```
 
 2. Search for "Tecomat Foxtrot Bridge" in the Add-on Store

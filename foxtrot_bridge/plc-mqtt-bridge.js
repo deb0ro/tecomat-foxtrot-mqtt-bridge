@@ -2,6 +2,17 @@ const net = require('net');
 const mqtt = require('mqtt');
 const iconv = require('iconv-lite');
 
+// Entity types that accept commands from Home Assistant
+const WRITABLE_ENTITIES = ['switch', 'number'];
+const SUPPORTED_ENTITIES = ['sensor', 'binary_sensor', ...WRITABLE_ENTITIES];
+const INTEGER_TYPES = ['SINT', 'INT', 'DINT', 'LINT', 'USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD'];
+const UNSIGNED_TYPES = ['USINT', 'UINT', 'UDINT', 'ULINT', 'BYTE', 'WORD', 'DWORD', 'LWORD'];
+
+const parseOptionalNumber = (value) => {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+};
+
 // Load configuration from environment variables
 const config = {
     plc: {
@@ -15,12 +26,24 @@ const config = {
         password: process.env.MQTT_PASSWORD,
         baseTopic: process.env.MQTT_TOPIC,
     },
-    variables: JSON.parse(process.env.VARIABLES || '[]').map(variable => ({
-        name: variable.name,
-        type: variable.type,
-        unitOfMeasurement: variable.unitOfMeasurement,
-        calculateEnergy: variable.calculateEnergy || false,
-    })),
+    writeEnabled: process.env.WRITE_ENABLED !== 'false',
+    variables: JSON.parse(process.env.VARIABLES || '[]').map(variable => {
+        let entity = (variable.entity || 'sensor').toLowerCase();
+        if (!SUPPORTED_ENTITIES.includes(entity)) {
+            console.warn(`Unsupported entity '${entity}' for ${variable.name}, falling back to sensor`);
+            entity = 'sensor';
+        }
+        return {
+            name: variable.name,
+            type: (variable.type || 'REAL').toUpperCase(),
+            entity,
+            unitOfMeasurement: variable.unitOfMeasurement || '',
+            calculateEnergy: variable.calculateEnergy || false,
+            min: parseOptionalNumber(variable.min),
+            max: parseOptionalNumber(variable.max),
+            step: parseOptionalNumber(variable.step),
+        };
+    }),
     interval: (parseInt(process.env.REFRESH_INTERVAL) || 5) * 1000, // Convert to milliseconds with fallback
 };
 
@@ -30,18 +53,29 @@ console.log('Configuration:', {
     mqtt: { ...config.mqtt, password: '****' } // Hide password in logs
 });
 
+const isWritable = (variable) => config.writeEnabled && WRITABLE_ENTITIES.includes(variable.entity);
+
+// With writing disabled, writable entities are exposed as their read-only counterparts
+const componentFor = (variable) => {
+    if (isWritable(variable)) return variable.entity;
+    if (variable.entity === 'switch') return 'binary_sensor';
+    if (variable.entity === 'number') return 'sensor';
+    return variable.entity;
+};
+
 class PlcMqttBridge {
     constructor() {
         this.plcConnected = false;
         this.mqttConnected = false;
         this.lastPlcRequestTimes = {};
         this.plcRequestInterval = config.interval;
+        this.plcBuffer = '';
         this.lastValues = {};
         this.lastUpdateTime = {};
         this.energyValues = {};
         this.setupMqtt();
         this.setupPlc();
-        
+
         // Add periodic connection status logging
         setInterval(() => {
             console.log(`Connection Status - PLC: ${this.plcConnected}, MQTT: ${this.mqttConnected}`);
@@ -51,7 +85,7 @@ class PlcMqttBridge {
     setupMqtt() {
         console.log('Setting up MQTT connection...');
         const mqttUrl = `mqtt://${config.mqtt.host}:${config.mqtt.port}`;
-        
+
         this.mqttClient = mqtt.connect(mqttUrl, {
             username: config.mqtt.username,
             password: config.mqtt.password,
@@ -65,6 +99,10 @@ class PlcMqttBridge {
             this.mqttConnected = true;
             this.sendMqttDiscoveryMessages();
             this.setupMqttSubscriptions();
+        });
+
+        this.mqttClient.on('message', (topic, payload, packet) => {
+            this.handleMqttCommand(topic, payload.toString(), packet);
         });
 
         this.mqttClient.on('error', (error) => {
@@ -83,9 +121,18 @@ class PlcMqttBridge {
         });
     }
 
+    commandTopic(variable) {
+        return `${config.mqtt.baseTopic}/${variable.name}/set`;
+    }
+
     setupMqttSubscriptions() {
-        config.variables.forEach(variable => {
-            const commandTopic = `${config.mqtt.baseTopic}/${variable.name}/set`;
+        if (!config.writeEnabled) {
+            console.log('Writing to PLC is disabled (write_enabled: false), not subscribing to command topics');
+            return;
+        }
+
+        config.variables.filter(isWritable).forEach(variable => {
+            const commandTopic = this.commandTopic(variable);
             this.mqttClient.subscribe(commandTopic, (err) => {
                 if (err) {
                     console.error(`Error subscribing to ${commandTopic}:`, err);
@@ -96,26 +143,88 @@ class PlcMqttBridge {
         });
     }
 
+    handleMqttCommand(topic, payload, packet) {
+        // A retained command would be replayed on every reconnect and silently rewrite the PLC
+        if (packet && packet.retain) {
+            console.warn(`Ignoring retained command on ${topic}: ${payload}`);
+            return;
+        }
+
+        const variable = config.variables.find(v => this.commandTopic(v) === topic);
+        if (!variable || !isWritable(variable)) {
+            console.warn(`Ignoring command for non-writable topic ${topic}`);
+            return;
+        }
+
+        const plcValue = this.convertCommandValue(variable, payload.trim());
+        if (plcValue === undefined) {
+            console.error(`Rejected invalid value '${payload}' for ${variable.name} (type ${variable.type}, min ${variable.min}, max ${variable.max})`);
+            return;
+        }
+
+        console.log(`Writing ${variable.name} = ${plcValue} (requested '${payload}')`);
+        this.sendPlcCommand(`SET:${variable.name},${plcValue}`);
+
+        // Read the value back so Home Assistant shows what the PLC really holds
+        setTimeout(() => this.sendPlcCommand(`GET:${variable.name}`), 500);
+    }
+
+    convertCommandValue(variable, payload) {
+        if (variable.type === 'BOOL') {
+            const normalized = payload.toUpperCase();
+            if (['ON', '1', 'TRUE'].includes(normalized)) return '1';
+            if (['OFF', '0', 'FALSE'].includes(normalized)) return '0';
+            return undefined;
+        }
+
+        let value = Number.parseFloat(payload);
+        if (!Number.isFinite(value)) return undefined;
+        if (variable.min !== undefined && value < variable.min) return undefined;
+        if (variable.max !== undefined && value > variable.max) return undefined;
+
+        if (INTEGER_TYPES.includes(variable.type)) {
+            value = Math.round(value);
+            if (UNSIGNED_TYPES.includes(variable.type) && value < 0) return undefined;
+        }
+
+        return value.toString();
+    }
+
+    deviceInfo() {
+        return {
+            identifiers: ['plc_foxtrot_bridge'],
+            name: 'PLC Foxtrot Bridge',
+            manufacturer: 'Custom Integration'
+        };
+    }
+
+    publishDiscovery(topic, message, variableName, label) {
+        this.mqttClient.publish(
+            topic,
+            message === null ? '' : JSON.stringify(message),
+            { retain: true, qos: 1 },
+            (err) => {
+                if (err) {
+                    console.error(`Error publishing ${label} discovery message for ${variableName}:`, err);
+                } else {
+                    console.log(`Successfully published ${label} discovery message for ${variableName}`);
+                }
+            }
+        );
+    }
+
     sendMqttDiscoveryMessages() {
         config.variables.forEach(variable => {
             // Sanitize variable name for MQTT discovery topic
             const sanitizedName = variable.name
             .replace(/[^a-zA-Z0-9-_]/g, '_');  // For MQTT topic (strict)
-        
-            const uniqueId = variable.name         // For Home Assistant (keep old format)
-            .replace(/\./g, '_')
-            .replace(/\[/g, '_')              // Replace '[' with '_'
-            .replace(/\]/g, '')               // Remove ']'
-            .replace(/\W/g, '_');
-            
-            // Power sensor (kW)
-            const powerDiscoveryTopic = `homeassistant/sensor/${sanitizedName}/config`;
-            const powerStateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
-            
+
+            const component = componentFor(variable);
+            const stateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
+
             // Determine appropriate device class based on unit of measurement
             let deviceClass = null;
-            let stateClass = "measurement";
-            
+
             switch(variable.unitOfMeasurement) {
                 case 'kW':
                 case 'W':
@@ -143,46 +252,58 @@ class PlcMqttBridge {
                     break;
                 // Add more mappings as needed
             }
-            
-            const powerDiscoveryMessage = {
-                name: `${variable.name}`,
-                state_topic: powerStateTopic,
-                unit_of_measurement: variable.unitOfMeasurement,
-                unique_id: `plc_${sanitizedName}_sensor`,
-                device: {
-                    identifiers: ['plc_foxtrot_bridge'],
-                    name: 'PLC Foxtrot Bridge',
-                    manufacturer: 'Custom Integration'
-                }
-            };
-            
-            // Only add device_class if we have a valid one
-            if (deviceClass) {
-                powerDiscoveryMessage.device_class = deviceClass;
-            }
-            
-            // Add state_class for measurements
-            powerDiscoveryMessage.state_class = stateClass;
 
-            // Publish sensor discovery
-            this.mqttClient.publish(
-                powerDiscoveryTopic, 
-                JSON.stringify(powerDiscoveryMessage), 
-                { retain: true, qos: 1 },
-                (err) => {
-                    if (err) {
-                        console.error(`Error publishing sensor discovery message for ${variable.name}:`, err);
-                    } else {
-                        console.log(`Successfully published sensor discovery message for ${variable.name}`);
+            const discoveryMessage = {
+                name: `${variable.name}`,
+                state_topic: stateTopic,
+                unique_id: `plc_${sanitizedName}_${component}`,
+                device: this.deviceInfo()
+            };
+
+            switch (component) {
+                case 'sensor':
+                    discoveryMessage.unit_of_measurement = variable.unitOfMeasurement;
+                    if (deviceClass) {
+                        discoveryMessage.device_class = deviceClass;
                     }
-                }
-            );
+                    discoveryMessage.state_class = "measurement";
+                    break;
+                case 'binary_sensor':
+                    discoveryMessage.payload_on = 'ON';
+                    discoveryMessage.payload_off = 'OFF';
+                    break;
+                case 'switch':
+                    discoveryMessage.command_topic = this.commandTopic(variable);
+                    discoveryMessage.payload_on = 'ON';
+                    discoveryMessage.payload_off = 'OFF';
+                    break;
+                case 'number':
+                    discoveryMessage.command_topic = this.commandTopic(variable);
+                    discoveryMessage.mode = 'box';
+                    discoveryMessage.min = variable.min ?? -1000000;
+                    discoveryMessage.max = variable.max ?? 1000000;
+                    discoveryMessage.step = variable.step ?? (INTEGER_TYPES.includes(variable.type) ? 1 : 0.1);
+                    if (variable.unitOfMeasurement) {
+                        discoveryMessage.unit_of_measurement = variable.unitOfMeasurement;
+                    }
+                    if (deviceClass === 'temperature') {
+                        discoveryMessage.device_class = deviceClass;
+                    }
+                    break;
+            }
+
+            this.publishDiscovery(`homeassistant/${component}/${sanitizedName}/config`, discoveryMessage, variable.name, component);
+
+            // Drop discovery left over from a previous entity type of this variable (e.g. sensor -> number)
+            SUPPORTED_ENTITIES
+                .filter(other => other !== component)
+                .forEach(other => this.publishDiscovery(`homeassistant/${other}/${sanitizedName}/config`, null, variable.name, `stale ${other}`));
 
             // If calculateEnergy is true, create energy sensor
             if (variable.calculateEnergy) {
                 const energyDiscoveryTopic = `homeassistant/sensor/${sanitizedName}_energy/config`;
                 const energyStateTopic = `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
-                
+
                 const energyDiscoveryMessage = {
                     name: `${variable.name} Energy`,
                     state_topic: energyStateTopic,
@@ -190,70 +311,66 @@ class PlcMqttBridge {
                     device_class: "energy",
                     state_class: "total_increasing",
                     unique_id: `plc_${sanitizedName}_energy`,
-                    device: {
-                        identifiers: ['plc_foxtrot_bridge'],
-                        name: 'PLC Foxtrot Bridge',
-                        manufacturer: 'Custom Integration'
-                    }
+                    device: this.deviceInfo()
                 };
 
-                // Publish energy sensor discovery
-                this.mqttClient.publish(
-                    energyDiscoveryTopic, 
-                    JSON.stringify(energyDiscoveryMessage), 
-                    { retain: true, qos: 1 },
-                    (err) => {
-                        if (err) {
-                            console.error(`Error publishing energy discovery message for ${variable.name}:`, err);
-                        } else {
-                            console.log(`Successfully published energy discovery message for ${variable.name}`);
-                        }
-                    }
-                );
+                this.publishDiscovery(energyDiscoveryTopic, energyDiscoveryMessage, variable.name, 'energy');
             }
         });
     }
 
+    formatStateValue(variable, value) {
+        if (['binary_sensor', 'switch'].includes(componentFor(variable))) {
+            return Number.parseFloat(value) ? 'ON' : 'OFF';
+        }
+        const numericValue = Number.parseFloat(value);
+        if (!Number.isFinite(numericValue)) {
+            return value.replace(/^"|"$/g, '');
+        }
+        if (componentFor(variable) === 'number') {
+            return numericValue.toString();
+        }
+        return numericValue.toFixed(3);
+    }
+
     publishToMqtt(variable, value) {
         if (!this.mqttConnected) {
-            console.log('MQTT not connected, unable to publish:', variable, value);
+            console.log('MQTT not connected, unable to publish:', variable.name, value);
             return;
         }
 
         const now = Date.now();
-        const powerValue = Number.parseFloat(value);
-        
-        // Publish power value (kW)
-        const powerTopic = `${config.mqtt.baseTopic}/${variable}/state`;
-        const roundedPowerValue = powerValue.toFixed(3);
-        
+        const stateTopic = `${config.mqtt.baseTopic}/${variable.name}/state`;
+        const stateValue = this.formatStateValue(variable, value);
+
         this.mqttClient.publish(
-            powerTopic, 
-            roundedPowerValue.toString(), 
+            stateTopic,
+            stateValue,
             { retain: true, qos: 1 },
             (err) => {
                 if (err) {
-                    console.error(`Error publishing power to ${powerTopic}:`, err);
+                    console.error(`Error publishing state to ${stateTopic}:`, err);
                 } else {
-                    console.log(`Successfully published power to ${powerTopic}: ${roundedPowerValue}`);
+                    console.log(`Successfully published state to ${stateTopic}: ${stateValue}`);
                 }
             }
         );
 
         // Check if this variable should calculate energy
-        const configVar = config.variables.find(v => v.name === variable);
-        if (configVar?.calculateEnergy) {
+        if (variable.calculateEnergy) {
+            const powerValue = Number.parseFloat(value);
+
             // Calculate and publish energy value (kWh)
-            if (this.lastUpdateTime[variable] && this.lastValues[variable] !== undefined) {
-                const timeDiff = (now - this.lastUpdateTime[variable]) / 1000 / 3600; // Convert to hours
-                const avgPower = (powerValue + this.lastValues[variable]) / 2; // Average power over the interval
+            if (this.lastUpdateTime[variable.name] && this.lastValues[variable.name] !== undefined) {
+                const timeDiff = (now - this.lastUpdateTime[variable.name]) / 1000 / 3600; // Convert to hours
+                const avgPower = (powerValue + this.lastValues[variable.name]) / 2; // Average power over the interval
                 const energyIncrement = avgPower * timeDiff; // kWh for this interval
-                
-                this.energyValues[variable] = (this.energyValues[variable] || 0) + energyIncrement;
-                
-                const energyTopic = `${config.mqtt.baseTopic}/${variable}/energy/state`;
-                const roundedEnergyValue = this.energyValues[variable].toFixed(3);
-                
+
+                this.energyValues[variable.name] = (this.energyValues[variable.name] || 0) + energyIncrement;
+
+                const energyTopic = `${config.mqtt.baseTopic}/${variable.name}/energy/state`;
+                const roundedEnergyValue = this.energyValues[variable.name].toFixed(3);
+
                 this.mqttClient.publish(
                     energyTopic,
                     roundedEnergyValue.toString(),
@@ -269,8 +386,8 @@ class PlcMqttBridge {
             }
 
             // Store current values for next calculation
-            this.lastValues[variable] = powerValue;
-            this.lastUpdateTime[variable] = now;
+            this.lastValues[variable.name] = powerValue;
+            this.lastUpdateTime[variable.name] = now;
         }
     }
 
@@ -295,7 +412,13 @@ class PlcMqttBridge {
     }
 
     connectPlc() {
+        // Drop the previous socket so reconnects do not pile up open connections on the PLC
+        if (this.plcConnection) {
+            this.plcConnection.removeAllListeners();
+            this.plcConnection.destroy();
+        }
         this.plcConnection = new net.Socket();
+        this.plcBuffer = '';
 
         this.plcConnection.on('connect', () => {
             console.log('Connected to PLC');
@@ -305,8 +428,11 @@ class PlcMqttBridge {
 
         this.plcConnection.on('data', (data) => {
             try {
-                const responses = iconv.decode(data, 'win1250').split('\r\n');
-                responses.forEach(response => {
+                // TCP may split or merge lines, keep the incomplete tail for the next chunk
+                this.plcBuffer += iconv.decode(data, 'win1250');
+                const lines = this.plcBuffer.split(/\r?\n/);
+                this.plcBuffer = lines.pop();
+                lines.forEach(response => {
                     if (response.trim()) this.handlePlcResponse(response);
                 });
             } catch (error) {
@@ -334,15 +460,12 @@ class PlcMqttBridge {
     requestPlcUpdates() {
         const now = Date.now();
         console.log('Checking for PLC updates...');
-        console.log('Current interval:', this.plcRequestInterval, 'ms');
-        
+
         config.variables.forEach(variable => {
             const lastRequest = this.lastPlcRequestTimes[variable.name] || 0;
             const timeSinceLastRequest = now - lastRequest;
-            console.log(`Time since last request for ${variable.name}: ${timeSinceLastRequest}ms`);
-            
+
             if (timeSinceLastRequest >= this.plcRequestInterval) {
-                console.log(`Requesting update for ${variable.name} from PLC...`);
                 this.sendPlcCommand(`GET:${variable.name}`);
                 this.lastPlcRequestTimes[variable.name] = now;
             }
@@ -356,7 +479,7 @@ class PlcMqttBridge {
         }
 
         try {
-            this.plcConnection.write(command + '\r\n');
+            this.plcConnection.write(iconv.encode(command + '\r\n', 'win1250'));
         } catch (error) {
             console.error('Error sending PLC command:', error);
             this.plcConnected = false;
@@ -365,29 +488,35 @@ class PlcMqttBridge {
 
     handlePlcResponse(response) {
         console.log('Raw PLC response:', response);
-        
-        const [method, params] = response.split(':');
-        if (!params) {
+
+        // Values may contain ':' or ',' (strings, TIME), so split only on the first separator
+        const methodEnd = response.indexOf(':');
+        if (methodEnd < 0) {
             console.log('Invalid PLC response format:', response);
             return;
         }
+        const method = response.slice(0, methodEnd);
+        const params = response.slice(methodEnd + 1);
 
         switch (method) {
             case 'GET':
             case 'DIFF':
                 try {
-                    const [variable, value] = params.split(',');
-                    if (!variable || value === undefined) {
+                    const valueStart = params.indexOf(',');
+                    if (valueStart < 0) {
                         console.log('Invalid variable/value format:', params);
                         return;
                     }
+                    const variableName = params.slice(0, valueStart);
+                    const value = params.slice(valueStart + 1);
 
-                    const configVar = config.variables.find(v => v.name === variable);
+                    // PLCComS names are case-insensitive
+                    const configVar = config.variables.find(v => v.name.toUpperCase() === variableName.toUpperCase());
                     if (configVar) {
-                        console.log(`Processing PLC value for ${variable}: ${value}`);
-                        this.publishToMqtt(configVar.name, value);
+                        console.log(`Processing PLC value for ${variableName}: ${value}`);
+                        this.publishToMqtt(configVar, value);
                     } else {
-                        console.log(`Unmatched variable: ${variable}`);
+                        console.log(`Unmatched variable: ${variableName}`);
                     }
                 } catch (error) {
                     console.error('Error handling PLC response:', error);
